@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gen2brain/alsa"
 )
 
 type Controller struct {
@@ -309,137 +306,6 @@ func (c *Controller) SetMute(mute bool) error {
 	cmd := exec.Command("/system/workdir/bin/amixer", "sset", "SPK mute", arg)
 	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
 	return cmd.Run()
-}
-
-// -------------------------------------------------------------
-// Pure Go Hardware Microphone Recording (hw:0,2 PDM Array)
-// -------------------------------------------------------------
-
-func (c *Controller) RecordRoom(durationSec int) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	cleanFile := "/tmp/rec_room_mono.wav"
-	_ = os.Remove(cleanFile)
-
-	if durationSec <= 0 {
-		durationSec = 5
-	}
-	if durationSec > 30 {
-		durationSec = 30
-	}
-
-	// 1. Temporarily pause launcher and kill maind so hw:0,2 is released
-	launcherPIDBytes, _ := exec.Command("pidof", "quasar_launcher2").Output()
-	launcherPID := strings.TrimSpace(string(launcherPIDBytes))
-	if launcherPID != "" {
-		_ = exec.Command("kill", "-STOP", launcherPID).Run()
-		defer func() {
-			_ = exec.Command("kill", "-CONT", launcherPID).Run()
-		}()
-	}
-
-	_ = exec.Command("killall", "-9", "maind").Run()
-	time.Sleep(300 * time.Millisecond)
-
-	// 2. Open hardware device hw:0,2 with MMAP in pure Go
-	cfg := alsa.Config{
-		Channels:    8,
-		Rate:        48000,
-		PeriodSize:  256,
-		PeriodCount: 4,
-		Format:      alsa.SNDRV_PCM_FORMAT_S32_LE,
-	}
-
-	pcm, err := alsa.PcmOpenByName("hw:0,2", alsa.PCM_IN|alsa.PCM_MMAP, &cfg)
-	if err != nil {
-		return "", fmt.Errorf("failed to open microphone array: %w", err)
-	}
-	defer pcm.Close()
-
-	totalFrames := uint32(durationSec * 48000)
-	rawSamples := make([]int32, totalFrames*8)
-
-	readFrames, err := pcm.MmapRead(rawSamples)
-	if err != nil && readFrames == 0 {
-		return "", fmt.Errorf("microphone capture failed: %w", err)
-	}
-
-	actualFrames := uint32(readFrames)
-	// Skip 500ms (24000 frames) to completely discard PDM hardware turn-on transient
-	const skipFrames = uint32(24000)
-	if actualFrames <= skipFrames+4800 {
-		return "", fmt.Errorf("insufficient frames recorded (%d)", actualFrames)
-	}
-
-	validFrames := actualFrames - skipFrames
-
-	// 3. Compute global DC bias mean across microphones 0..3
-	var sum float64 = 0.0
-	for i := uint32(0); i < validFrames; i++ {
-		offset := (i + skipFrames) * 8
-		c0 := float64(rawSamples[offset+0])
-		c1 := float64(rawSamples[offset+1])
-		c2 := float64(rawSamples[offset+2])
-		c3 := float64(rawSamples[offset+3])
-		sum += (c0 + c1 + c2 + c3) / 4.0
-	}
-	meanDC := sum / float64(validFrames)
-
-	// 4. Combine channels 0..3 & apply 1-pole high-pass DC blocker initialized with zero transient
-	firstOffset := skipFrames * 8
-	prevX := ((float64(rawSamples[firstOffset+0]) + float64(rawSamples[firstOffset+1]) + float64(rawSamples[firstOffset+2]) + float64(rawSamples[firstOffset+3])) / 4.0) - meanDC
-	var prevY float64 = 0.0
-	const R = 0.995 // High-pass cutoff ~38 Hz at 48kHz sample rate
-
-	filtered := make([]float64, validFrames)
-	var maxAbs float64 = 1.0
-	const settlingFrames = uint32(2000) // ignore first 40ms of filter settling for peak detection
-
-	for i := uint32(0); i < validFrames; i++ {
-		offset := (i + skipFrames) * 8
-		c0 := float64(rawSamples[offset+0])
-		c1 := float64(rawSamples[offset+1])
-		c2 := float64(rawSamples[offset+2])
-		c3 := float64(rawSamples[offset+3])
-		x := ((c0 + c1 + c2 + c3) / 4.0) - meanDC
-
-		// y[n] = x[n] - x[n-1] + R * y[n-1]
-		y := x - prevX + R*prevY
-		prevX = x
-		prevY = y
-		filtered[i] = y
-
-		if i > settlingFrames {
-			absY := math.Abs(y)
-			if absY > maxAbs {
-				maxAbs = absY
-			}
-		}
-	}
-
-	// 5. Normalize with a safety noise floor (prevents blowing up silence into static)
-	if maxAbs < 1000000.0 {
-		maxAbs = 1000000.0
-	}
-
-	scale := 26000.0 / maxAbs
-	pcm16 := make([]byte, validFrames*2)
-	for i, val := range filtered {
-		s := int32(val * scale)
-		if s > 32767 {
-			s = 32767
-		} else if s < -32768 {
-			s = -32768
-		}
-		binary.LittleEndian.PutUint16(pcm16[i*2:], uint16(int16(s)))
-	}
-
-	if err := writeWAVFile(cleanFile, pcm16, 48000, 1, 16); err != nil {
-		return "", fmt.Errorf("failed to save wav: %w", err)
-	}
-
-	return cleanFile, nil
 }
 
 // -------------------------------------------------------------
