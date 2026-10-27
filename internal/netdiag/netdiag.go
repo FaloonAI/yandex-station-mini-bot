@@ -3,9 +3,11 @@ package netdiag
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -107,6 +109,27 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
+// GetDefaultGateway discovers the IPv4 default gateway from /proc/net/route or defaults to 192.168.20.1.
+func GetDefaultGateway() string {
+	data, err := os.ReadFile("/proc/net/route")
+	if err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines[1:] {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[1] == "00000000" { // Destination 0.0.0.0 (default gw)
+				gwHex := fields[2]
+				if len(gwHex) == 8 {
+					b, err := hex.DecodeString(gwHex)
+					if err == nil && len(b) == 4 {
+						return fmt.Sprintf("%d.%d.%d.%d", b[3], b[2], b[1], b[0])
+					}
+				}
+			}
+		}
+	}
+	return "192.168.20.1"
+}
+
 // DefaultPingTargets defines typical diagnostic destinations for station mini.
 var DefaultPingTargets = []PingTarget{
 	{Name: "Шлюз (Роутер)", Host: "192.168.20.1"},
@@ -117,8 +140,18 @@ var DefaultPingTargets = []PingTarget{
 
 // NewDiagnostics creates an instance of Diagnostics.
 func NewDiagnostics(opts ...Option) *Diagnostics {
+	targets := make([]PingTarget, len(DefaultPingTargets))
+	copy(targets, DefaultPingTargets)
+	if gw := GetDefaultGateway(); gw != "" {
+		for i := range targets {
+			if strings.Contains(targets[i].Name, "Шлюз") {
+				targets[i].Host = gw
+			}
+		}
+	}
+
 	d := &Diagnostics{
-		pingTargets:        DefaultPingTargets,
+		pingTargets:        targets,
 		wifiIface:          "wlan0",
 		speedtestURL:       "https://mirror.yandex.ru/debian/ls-lR.gz",
 		speedtestChunkSize: 5 * 1024 * 1024, // 5 MB
@@ -162,9 +195,11 @@ func (d *Diagnostics) PingHosts(ctx context.Context) ([]PingResult, error) {
 }
 
 var (
-	packetLossRe = regexp.MustCompile(`([0-9.]+)%\s*packet loss`)
-	rttAvgRe     = regexp.MustCompile(`(?:rtt|round-trip)\s+min/avg/max[^=]*=\s*[0-9.]+/([0-9.]+)/`)
-	singleTimeRe = regexp.MustCompile(`time=([0-9.]+)\s*ms`)
+	packetLossRe    = regexp.MustCompile(`([0-9.]+)%\s*packet loss`)
+	rttAvgRe        = regexp.MustCompile(`(?:rtt|round-trip)\s+min/avg/max[^=]*=\s*[0-9.]+/([0-9.]+)/`)
+	singleTimeRe    = regexp.MustCompile(`time=([0-9.]+)\s*ms`)
+	arpingLatencyRe = regexp.MustCompile(`(?:reply|Reply).*?([0-9.]+)\s*ms`)
+	arpingRecvRe    = regexp.MustCompile(`Received\s+([1-9][0-9]*)\s+reply`)
 )
 
 func (d *Diagnostics) pingSingle(ctx context.Context, target PingTarget) PingResult {
@@ -206,6 +241,26 @@ func (d *Diagnostics) pingSingle(ctx context.Context, target PingTarget) PingRes
 		}
 	} else {
 		res.Success = res.PacketLoss < 100
+	}
+
+	// Fallback to ARPING for local subnet gateway or LAN targets if ICMP echo is dropped by router firewall
+	if (!res.Success || res.PacketLoss >= 100) && d.wifiIface != "" {
+		arpOut, arpErr := d.execCmd(ctx, "arping", "-c", "2", "-I", d.wifiIface, target.Host)
+		if arpErr == nil || len(arpOut) > 0 {
+			rawArp := string(arpOut)
+			if m := arpingLatencyRe.FindStringSubmatch(rawArp); len(m) > 1 {
+				if latencyMs, parseErr := strconv.ParseFloat(m[1], 64); parseErr == nil {
+					res.Latency = time.Duration(latencyMs * float64(time.Millisecond))
+					res.Success = true
+					res.PacketLoss = 0
+					res.Error = ""
+				}
+			} else if arpingRecvRe.MatchString(rawArp) {
+				res.Success = true
+				res.PacketLoss = 0
+				res.Error = ""
+			}
+		}
 	}
 
 	return res

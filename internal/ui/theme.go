@@ -24,6 +24,7 @@ const (
 	BtnPresence   ButtonID = "presence"
 	BtnNetDiag    ButtonID = "netdiag"
 	BtnTheme      ButtonID = "theme"
+	BtnEmoji      ButtonID = "emoji"
 	BtnBack       ButtonID = "back"
 )
 
@@ -70,7 +71,7 @@ func (t Theme) Icon(id ButtonID) string {
 		return t.Presence
 	case BtnNetDiag:
 		return t.NetDiag
-	case BtnTheme:
+	case BtnTheme, BtnEmoji:
 		return t.Theme
 	case BtnBack:
 		return t.Back
@@ -278,11 +279,18 @@ func (tm *ThemeManager) SetIcon(id ButtonID, icon string) {
 		tm.currentTheme.Presence = icon
 	case BtnNetDiag:
 		tm.currentTheme.NetDiag = icon
-	case BtnTheme:
+	case BtnTheme, BtnEmoji:
 		tm.currentTheme.Theme = icon
 	case BtnBack:
 		tm.currentTheme.Back = icon
 	}
+}
+
+// ResetDefaults resets all button emojis back to ThemeDefault.
+func (tm *ThemeManager) ResetDefaults() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.currentTheme = ThemeDefault
 }
 
 // Icon returns the icon for the specified ButtonID under the currently active theme.

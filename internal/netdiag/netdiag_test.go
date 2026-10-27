@@ -126,6 +126,56 @@ round-trip min/avg/max = 1.142/1.198/1.254 ms`
 	}
 }
 
+func TestPingHostsArpingFallback(t *testing.T) {
+	mockExec := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ping" {
+			// Router drops ICMP echo completely
+			out := `PING 192.168.20.1 (192.168.20.1): 56 data bytes
+--- 192.168.20.1 ping statistics ---
+2 packets transmitted, 0 packets received, 100% packet loss`
+			return []byte(out), fmt.Errorf("exit status 1")
+		}
+		if name == "arping" {
+			out := `ARPING to 192.168.20.1 from 192.168.20.209 via wlan0
+Unicast reply from 192.168.20.1 [24:0f:5e:02:02:9a] 1.215ms
+Unicast reply from 192.168.20.1 [24:0f:5e:02:02:9a] 3.775ms
+Sent 2 probe(s) (1 broadcast(s))
+Received 2 reply (0 request(s), 0 broadcast(s))`
+			return []byte(out), nil
+		}
+		return nil, fmt.Errorf("unknown command")
+	}
+
+	targets := []PingTarget{
+		{Name: "Шлюз (Роутер)", Host: "192.168.20.1"},
+	}
+
+	d := NewDiagnostics(
+		WithPingTargets(targets),
+		WithCommandExecutor(mockExec),
+	)
+
+	results, err := d.PingHosts(context.Background())
+	if err != nil {
+		t.Fatalf("PingHosts error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	r := results[0]
+	if !r.Success {
+		t.Errorf("expected arping fallback to succeed, error: %s", r.Error)
+	}
+	if r.PacketLoss != 0 {
+		t.Errorf("expected 0%% loss with arping, got %f", r.PacketLoss)
+	}
+	if r.Latency <= 0 {
+		t.Errorf("expected positive latency, got %v", r.Latency)
+	}
+}
+
 func TestRunSpeedtest(t *testing.T) {
 	// Setup test HTTP server generating a 100KB payload
 	payloadSize := int64(100 * 1024)
