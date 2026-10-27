@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	defaultBaseURL     = "https://api.telegram.org/bot"
-	defaultPollTimeout = 25 // seconds for getUpdates long polling
-	defaultReqTimeout  = 30 * time.Second
+	defaultBaseURL       = "https://api.telegram.org/bot"
+	defaultPollTimeout   = 25 // seconds for getUpdates long polling
+	defaultReqTimeout    = 30 * time.Second
 	defaultUploadTimeout = 120 * time.Second
 )
 
@@ -97,8 +97,8 @@ func NewClient(token string, adminID int64, opts ...ClientOption) (*Client, erro
 	}
 
 	c := &Client{
-		token:       strings.TrimSpace(token),
-		adminID:     adminID,
+		token:      strings.TrimSpace(token),
+		adminID:    adminID,
 		apiBaseURL: defaultBaseURL,
 		httpClient: &http.Client{
 			Timeout: 0,
@@ -589,4 +589,3 @@ func (c *Client) DownloadFile(ctx context.Context, fileID, destPath string) (str
 
 	return destPath, nil
 }
-

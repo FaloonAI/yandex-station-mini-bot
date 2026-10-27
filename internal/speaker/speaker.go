@@ -2,6 +2,7 @@ package speaker
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -16,7 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gen2brain/alsa"
 	"github.com/hajimehoshi/go-mp3"
+	"github.com/kazzmir/opus-go/ogg"
+	"github.com/kazzmir/opus-go/opus"
+	"github.com/kazzmir/opus-go/wav"
 )
 
 type Controller struct {
@@ -50,8 +55,12 @@ func (c *Controller) PlayWav(path string) error {
 
 	c.stopCurrentPlaybackLocked()
 
-	cmd := exec.Command("/system/workdir/bin/aplay", "-D", "plughw:0,0", path)
-	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
+	cmd := exec.Command("/system/workdir/bin/aplay", "-D", "default", path)
+	cmd.Env = append(os.Environ(),
+		"ALSA_CONFIG_PATH=/tmp/alsa/alsa.conf",
+		"ALSA_CONFIG_DIR=/tmp/alsa",
+		"LD_LIBRARY_PATH=/system/workdir/lib:/system/vendor/quasar/libs",
+	)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start aplay: %w", err)
@@ -106,9 +115,16 @@ func (c *Controller) PlayTTS(text string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Embedded Buildroot system has outdated root CA certificates; use InsecureSkipVerify
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("tts request failed: %w", err)
@@ -142,6 +158,84 @@ func (c *Controller) PlayTTS(text string) error {
 	return c.PlayWav(tempWav)
 }
 
+// DecodeOggOpusToWav decodes an Ogg Opus audio file into a 48kHz WAV file using pure Go
+func DecodeOggOpusToWav(inOggPath, outWavPath string) error {
+	in, err := os.Open(inOggPath)
+	if err != nil {
+		return fmt.Errorf("failed to open opus file: %w", err)
+	}
+	defer in.Close()
+
+	r, err := ogg.NewOpusReader(in)
+	if err != nil {
+		return fmt.Errorf("failed to create opus reader: %w", err)
+	}
+
+	dec, err := opus.NewDecoderFromHead(r.Head)
+	if err != nil {
+		return fmt.Errorf("failed to create opus decoder: %w", err)
+	}
+	defer dec.Close()
+
+	outf, err := os.Create(outWavPath)
+	if err != nil {
+		return fmt.Errorf("failed to create wav output: %w", err)
+	}
+	defer outf.Close()
+
+	channels := int(r.Head.Channels)
+	if channels <= 0 {
+		channels = 1
+	}
+
+	ww, err := wav.NewWriter(outf, 48000, channels)
+	if err != nil {
+		return fmt.Errorf("failed to create wav writer: %w", err)
+	}
+	defer ww.Close()
+
+	maxFrame := 5760
+	pcm := make([]int16, maxFrame*channels)
+	preSkipRemaining := int(r.Head.PreSkip)
+
+	for {
+		pkt, err := r.ReadAudioPacket()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read audio packet: %w", err)
+		}
+
+		n, err := dec.Decode(pkt.Data, pcm, maxFrame, false)
+		if err != nil {
+			return fmt.Errorf("decode opus packet: %w", err)
+		}
+
+		frames := pcm[:n*channels]
+		if preSkipRemaining > 0 {
+			skip := preSkipRemaining
+			if skip > n {
+				skip = n
+			}
+			preSkipRemaining -= skip
+			drop := skip * channels
+			if drop >= len(frames) {
+				continue
+			}
+			frames = frames[drop:]
+		}
+
+		if len(frames) > 0 {
+			if err := ww.WriteInt16PCM(frames); err != nil {
+				return fmt.Errorf("write pcm: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // StartSiren plays siren in a continuous loop until stopped
 func (c *Controller) StartSiren() {
 	c.mu.Lock()
@@ -163,8 +257,12 @@ func (c *Controller) StartSiren() {
 			case <-stopCh:
 				return
 			default:
-				cmd := exec.Command("/system/workdir/bin/aplay", "-D", "plughw:0,0", sirenPath)
-				cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
+				cmd := exec.Command("/system/workdir/bin/aplay", "-D", "default", sirenPath)
+				cmd.Env = append(os.Environ(),
+					"ALSA_CONFIG_PATH=/tmp/alsa/alsa.conf",
+					"ALSA_CONFIG_DIR=/tmp/alsa",
+					"LD_LIBRARY_PATH=/system/workdir/lib:/system/vendor/quasar/libs",
+				)
 				_ = cmd.Run()
 				time.Sleep(100 * time.Millisecond)
 			}
@@ -232,7 +330,7 @@ func (c *Controller) SetVolume(percent int) error {
 func (c *Controller) SetMute(mute bool) error {
 	arg := "on"
 	if mute {
-		arg = "off" // In ALSA for this driver, 'off' disables playback on SPK
+		arg = "off"
 	}
 	cmd := exec.Command("/system/workdir/bin/amixer", "sset", "SPK mute", arg)
 	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
@@ -240,34 +338,102 @@ func (c *Controller) SetMute(mute bool) error {
 }
 
 // -------------------------------------------------------------
-// Microphone Recording (8ch S32_LE downmixed to 1ch S16_LE WAV)
+// Pure Go Hardware Microphone Recording (hw:0,2 PDM Array)
 // -------------------------------------------------------------
 
 func (c *Controller) RecordRoom(durationSec int) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	rawFile := "/tmp/rec_room_raw.wav"
 	cleanFile := "/tmp/rec_room_mono.wav"
-	_ = os.Remove(rawFile)
 	_ = os.Remove(cleanFile)
 
-	scriptPath := fmt.Sprintf("%s/record_helper.sh", c.scriptsDir)
-	cmd := exec.Command("sh", scriptPath, strconv.Itoa(durationSec), rawFile)
-	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
-	
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("record_helper failed: %w", err)
+	if durationSec <= 0 {
+		durationSec = 5
+	}
+	if durationSec > 30 {
+		durationSec = 30
 	}
 
-	info, err := os.Stat(rawFile)
-	if err != nil || info.Size() < 2000 {
-		return "", fmt.Errorf("recorded file missing or too small")
+	// 1. Temporarily pause launcher and kill maind so hw:0,2 is released
+	launcherPIDBytes, _ := exec.Command("pidof", "quasar_launcher2").Output()
+	launcherPID := strings.TrimSpace(string(launcherPIDBytes))
+	if launcherPID != "" {
+		_ = exec.Command("kill", "-STOP", launcherPID).Run()
+		defer func() {
+			_ = exec.Command("kill", "-CONT", launcherPID).Run()
+		}()
 	}
 
-	// Downmix 8-channel S32_LE to clean Mono 16-bit WAV with normalization
-	if err := downmix8chToMono16(rawFile, cleanFile); err != nil {
-		return "", fmt.Errorf("audio downmix failed: %w", err)
+	_ = exec.Command("killall", "-9", "maind").Run()
+	time.Sleep(300 * time.Millisecond)
+
+	// 2. Open hardware device hw:0,2 with MMAP in pure Go
+	cfg := alsa.Config{
+		Channels:    8,
+		Rate:        48000,
+		PeriodSize:  256,
+		PeriodCount: 4,
+		Format:      alsa.SNDRV_PCM_FORMAT_S32_LE,
+	}
+
+	pcm, err := alsa.PcmOpenByName("hw:0,2", alsa.PCM_IN|alsa.PCM_MMAP, &cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to open microphone array: %w", err)
+	}
+	defer pcm.Close()
+
+	totalFrames := uint32(durationSec * 48000)
+	rawSamples := make([]int32, totalFrames*8)
+
+	readFrames, err := pcm.MmapRead(rawSamples)
+	if err != nil && readFrames == 0 {
+		return "", fmt.Errorf("microphone capture failed: %w", err)
+	}
+
+	// 3. Downmix captured 8-channel S32 samples to 1-channel 16-bit WAV with volume normalization
+	actualFrames := uint32(readFrames)
+	if actualFrames > totalFrames {
+		actualFrames = totalFrames
+	}
+
+	monoSamps := make([]int16, actualFrames)
+	var maxAbs float64 = 1.0
+
+	for i := uint32(0); i < actualFrames; i++ {
+		offset := i * 8
+		ch0 := float64(rawSamples[offset+0])
+		ch1 := float64(rawSamples[offset+1])
+		avg := (ch0 + ch1) / 2.0
+		// Convert from 32-bit signed to 16-bit range
+		val16 := avg / 65536.0
+		if math.Abs(val16) > maxAbs {
+			maxAbs = math.Abs(val16)
+		}
+		monoSamps[i] = int16(val16)
+	}
+
+	// Normalize peak gain for loud, clear room audio
+	if maxAbs > 10.0 {
+		gain := 31000.0 / maxAbs
+		for i := range monoSamps {
+			norm := float64(monoSamps[i]) * gain
+			if norm > 32767 {
+				norm = 32767
+			} else if norm < -32768 {
+				norm = -32768
+			}
+			monoSamps[i] = int16(norm)
+		}
+	}
+
+	outBuf := new(bytes.Buffer)
+	for _, s := range monoSamps {
+		_ = binary.Write(outBuf, binary.LittleEndian, s)
+	}
+
+	if err := writeWAVFile(cleanFile, outBuf.Bytes(), 48000, 1, 16); err != nil {
+		return "", fmt.Errorf("failed to save wav: %w", err)
 	}
 
 	return cleanFile, nil
@@ -285,11 +451,48 @@ func (c *Controller) GetFastfetch() (string, error) {
 	cmd := exec.Command(fastfetchBin, "--pipe", "false")
 	cmd.Env = append(os.Environ(), "PATH=/data/opt/bin:/usr/bin:/bin")
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// Fallback simple system info
-		return c.getFallbackSysInfo(), nil
+	baseOutput := cleanFastfetchOutput(string(out))
+	if err != nil || strings.TrimSpace(baseOutput) == "" {
+		baseOutput = c.getFallbackSysInfo()
 	}
-	return cleanFastfetchOutput(string(out)), nil
+
+	// Enrich with detailed hardware telemetry
+	extra := c.getHardwareTelemetry()
+	if extra != "" {
+		return baseOutput + "\n" + extra, nil
+	}
+	return baseOutput, nil
+}
+
+func (c *Controller) getHardwareTelemetry() string {
+	var sb strings.Builder
+
+	// 1. CPU Temperature
+	tempC := "N/A"
+	if data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp"); err == nil {
+		raw := strings.TrimSpace(string(data))
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			tempC = fmt.Sprintf("%.1f°C", float64(val)/1000.0)
+		}
+	}
+
+	// 2. Load average
+	loadAvg := "N/A"
+	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 3 {
+			loadAvg = fmt.Sprintf("%s, %s, %s", fields[0], fields[1], fields[2])
+		}
+	}
+
+	// 3. Hardware model & SoC details
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString("📟 Модель: Яндекс Станция Mini (YNDX-0004)\n")
+	sb.WriteString("⚡ SoC: Amlogic Meson A113X (4x Cortex-A53 @ 1.20GHz)\n")
+	sb.WriteString(fmt.Sprintf("🌡️ Температура CPU: %s\n", tempC))
+	sb.WriteString(fmt.Sprintf("📈 Load Average: %s", loadAvg))
+
+	return sb.String()
 }
 
 func (c *Controller) getFallbackSysInfo() string {
@@ -302,17 +505,21 @@ func (c *Controller) GetWiFiStatus() (string, error) {
 	cmd := exec.Command("wpa_cli", "-iwlan0", "status")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "Wi-Fi: нет данных", nil
+		return "📶 Wi-Fi: нет данных", nil
 	}
 
 	ssid := ""
 	ip := ""
+	freq := ""
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "ssid=") {
 			ssid = strings.TrimPrefix(line, "ssid=")
 		}
 		if strings.HasPrefix(line, "ip_address=") {
 			ip = strings.TrimPrefix(line, "ip_address=")
+		}
+		if strings.HasPrefix(line, "freq=") {
+			freq = strings.TrimPrefix(line, "freq=") + " MHz"
 		}
 	}
 
@@ -327,7 +534,12 @@ func (c *Controller) GetWiFiStatus() (string, error) {
 		}
 	}
 
-	return fmt.Sprintf("📶 Сеть: %s\n📡 Сигнал: %s\n🌐 IP: %s", ssid, rssi, ip), nil
+	freqStr := ""
+	if freq != "" {
+		freqStr = fmt.Sprintf(" (%s)", freq)
+	}
+
+	return fmt.Sprintf("📶 Сеть: %s%s\n📡 Сигнал: %s\n🌐 IP: %s", ssid, freqStr, rssi, ip), nil
 }
 
 func (c *Controller) SetGesturesEnabled(enable bool) error {
@@ -364,8 +576,6 @@ func (c *Controller) Reboot() error {
 // Alice Dialogue History
 // -------------------------------------------------------------
 
-var dialogRegex = regexp.MustCompile(`(Recognized:.*?|User:.*?|Directive:.*?)`)
-
 func (c *Controller) GetLatestDialogs(limit int) ([]string, error) {
 	data, err := os.ReadFile(c.quasarLogs)
 	if err != nil {
@@ -390,74 +600,6 @@ func (c *Controller) GetLatestDialogs(limit int) ([]string, error) {
 	}
 
 	return results, nil
-}
-
-// -------------------------------------------------------------
-// Audio Downmixer Helper (8ch 32-bit LE -> 1ch 16-bit LE)
-// -------------------------------------------------------------
-
-func downmix8chToMono16(inFile, outFile string) error {
-	f, err := os.Open(inFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Read and skip WAV header (44 bytes)
-	header := make([]byte, 44)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return err
-	}
-
-	rawBytes, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-
-	// 8 channels, 4 bytes per sample = 32 bytes per audio frame
-	numFrames := len(rawBytes) / 32
-	if numFrames == 0 {
-		return fmt.Errorf("no audio frames found")
-	}
-
-	monoSamples := make([]int16, numFrames)
-	var maxAbs float64 = 1.0
-
-	// Extract channel 0 and 1, convert from S32 to S16
-	for i := 0; i < numFrames; i++ {
-		offset := i * 32
-		ch0 := int32(binary.LittleEndian.Uint32(rawBytes[offset : offset+4]))
-		ch1 := int32(binary.LittleEndian.Uint32(rawBytes[offset+4 : offset+8]))
-
-		avg := (float64(ch0) + float64(ch1)) / 2.0
-		// Convert 32-bit signed float to 16-bit range
-		val16 := avg / 65536.0
-		if math.Abs(val16) > maxAbs {
-			maxAbs = math.Abs(val16)
-		}
-		monoSamples[i] = int16(val16)
-	}
-
-	// Normalize volume to 95% peak
-	if maxAbs > 10.0 {
-		gain := 31000.0 / maxAbs
-		for i := 0; i < numFrames; i++ {
-			norm := float64(monoSamples[i]) * gain
-			if norm > 32767 {
-				norm = 32767
-			} else if norm < -32768 {
-				norm = -32768
-			}
-			monoSamples[i] = int16(norm)
-		}
-	}
-
-	outBuf := new(bytes.Buffer)
-	for _, s := range monoSamples {
-		_ = binary.Write(outBuf, binary.LittleEndian, s)
-	}
-
-	return writeWAVFile(outFile, outBuf.Bytes(), 48000, 1, 16)
 }
 
 func writeWAVFile(filePath string, pcmData []byte, sampleRate, numChannels, bitsPerSample int) error {

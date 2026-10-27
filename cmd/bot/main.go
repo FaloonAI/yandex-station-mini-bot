@@ -403,7 +403,10 @@ func runListenCommand(ctx context.Context, tg *telegram.Client, spk *speaker.Con
 			_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка записи: %v", err))
 			return
 		}
-		_, _ = tg.SendVoiceFile(ctx, chatID, filePath, fmt.Sprintf("🎙️ Аудиозапись из комнаты (%d сек)", sec), nil)
+		_, err = tg.SendAudioFile(ctx, chatID, filePath, fmt.Sprintf("🎙️ Аудиозапись из комнаты (%d сек)", sec), fmt.Sprintf("Запись %d сек", sec), "Яндекс Станция Mini", nil)
+		if err != nil {
+			_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки аудио: %v", err))
+		}
 	}()
 }
 
@@ -425,9 +428,16 @@ func handleVoiceIntercom(ctx context.Context, u *telegram.Update, tg *telegram.C
 		}
 
 		if fileID != "" {
-			voicePath, err := tg.DownloadFile(ctx, fileID, "/tmp/incoming_voice.wav")
-			if err == nil {
-				_ = spk.PlayWav(voicePath)
+			ogaPath := "/tmp/incoming_voice.oga"
+			wavPath := "/tmp/incoming_voice.wav"
+			_ = os.Remove(ogaPath)
+			_ = os.Remove(wavPath)
+			if downloadedPath, err := tg.DownloadFile(ctx, fileID, ogaPath); err == nil {
+				if decErr := speaker.DecodeOggOpusToWav(downloadedPath, wavPath); decErr == nil {
+					_ = spk.PlayWav(wavPath)
+				} else {
+					_ = spk.PlayWav(downloadedPath)
+				}
 			}
 		}
 
@@ -437,7 +447,10 @@ func handleVoiceIntercom(ctx context.Context, u *telegram.Update, tg *telegram.C
 		_, _ = tg.SendTextMessage(ctx, chatID, "👂 Записываю ответ из комнаты (5 сек)...")
 		recFile, err := spk.RecordRoom(5)
 		if err == nil {
-			_, _ = tg.SendVoiceFile(ctx, chatID, recFile, "🎙️ Ответ из комнаты", nil)
+			_, err = tg.SendAudioFile(ctx, chatID, recFile, "🎙️ Ответ из комнаты", "Ответ из комнаты", "Яндекс Станция Mini", nil)
+			if err != nil {
+				_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки ответа: %v", err))
+			}
 		}
 	}()
 }

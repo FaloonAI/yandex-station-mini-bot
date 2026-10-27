@@ -13,17 +13,17 @@ const (
 	CallbackMenuRecord = "menu:record"
 	CallbackMenuSystem = "menu:system"
 
-	CallbackSoundPlayPrefix   = "snd:play:"
-	CallbackVolumeSetPrefix   = "vol:set:"
-	CallbackVolumeStepPrefix  = "vol:step:"
+	CallbackSoundPlayPrefix      = "snd:play:"
+	CallbackVolumeSetPrefix      = "vol:set:"
+	CallbackVolumeStepPrefix     = "vol:step:"
 	CallbackRecordDurationPrefix = "rec:sec:"
-	CallbackSystemActionPrefix = "sys:act:"
+	CallbackSystemActionPrefix   = "sys:act:"
 
-	ActionStopPlayback = "stop_sound"
-	ActionStatus       = "status"
-	ActionQuasarLogs   = "quasar_logs"
-	ActionBotLogs      = "bot_logs"
-	ActionRestartQuasar= "restart_quasar"
+	ActionStopPlayback  = "stop_sound"
+	ActionStatus        = "status"
+	ActionQuasarLogs    = "quasar_logs"
+	ActionBotLogs       = "bot_logs"
+	ActionRestartQuasar = "restart_quasar"
 )
 
 // NewButton creates an InlineKeyboardButton that sends a callback query.
