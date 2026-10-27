@@ -361,3 +361,9 @@ type GetUpdatesRequest struct {
 	Timeout        int      `json:"timeout,omitempty"`
 	AllowedUpdates []string `json:"allowed_updates,omitempty"`
 }
+
+// DeleteMessageRequest contains parameters for deleteMessage.
+type DeleteMessageRequest struct {
+	ChatID    int64 `json:"chat_id"`
+	MessageID int64 `json:"message_id"`
+}

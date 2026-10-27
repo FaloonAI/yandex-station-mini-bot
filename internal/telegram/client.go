@@ -360,6 +360,32 @@ func (c *Client) AnswerCallbackAlert(ctx context.Context, callbackQueryID string
 	})
 }
 
+// DeleteMessage deletes a message in a chat.
+func (c *Client) DeleteMessage(ctx context.Context, chatID int64, messageID int64) error {
+	_, err := doJSON[bool](ctx, c, "deleteMessage", DeleteMessageRequest{
+		ChatID:    chatID,
+		MessageID: messageID,
+	}, defaultReqTimeout)
+	return err
+}
+
+// DeleteAfter schedules automatic deletion of one or more messages after duration d.
+func (c *Client) DeleteAfter(d time.Duration, chatID int64, messageIDs ...int64) {
+	if len(messageIDs) == 0 || d <= 0 {
+		return
+	}
+	go func() {
+		time.Sleep(d)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultReqTimeout)
+		defer cancel()
+		for _, msgID := range messageIDs {
+			if msgID > 0 {
+				_ = c.DeleteMessage(ctx, chatID, msgID)
+			}
+		}
+	}()
+}
+
 // postMultipart uploads a file along with text fields using multipart/form-data.
 func (c *Client) postMultipart(ctx context.Context, method string, fields map[string]string, fileFieldName string, fileName string, fileReader io.Reader) (*Message, error) {
 	reqCtx := ctx

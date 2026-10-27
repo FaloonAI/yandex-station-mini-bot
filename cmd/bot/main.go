@@ -99,6 +99,24 @@ func main() {
 	}
 }
 
+func (a *App) autoDeleteDelay() time.Duration {
+	sec := a.cfg.AutoDeleteSec
+	if sec <= 0 {
+		sec = 5
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func (a *App) sendEphemeral(ctx context.Context, chatID int64, text string, triggerMsgID int64) {
+	delay := a.autoDeleteDelay()
+	rep, err := a.tg.SendTextMessage(ctx, chatID, text)
+	if err == nil && rep != nil {
+		a.tg.DeleteAfter(delay, chatID, triggerMsgID, rep.MessageID)
+	} else if triggerMsgID > 0 {
+		a.tg.DeleteAfter(delay, chatID, triggerMsgID)
+	}
+}
+
 func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 	// 1. Handle Callback Queries (Inline buttons)
 	if u.IsCallback() {
@@ -136,44 +154,53 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 		switch cmd {
 		case "start", "menu":
 			a.sendMainMenu(ctx, msg.Chat.ID)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "status", "fastfetch":
 			a.sendFastfetchStatus(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "timer":
-			a.handleTimerCommand(ctx, msg.Chat.ID, args)
+			a.handleTimerCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "alarm":
-			a.handleAlarmCommand(ctx, msg.Chat.ID, args)
+			a.handleAlarmCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "presence", "whoishome":
 			a.showPresenceMenu(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "net", "ping":
 			a.showNetDiagMenu(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "speedtest":
 			a.runSpeedtest(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "emoji", "theme":
 			a.showEmojiMenu(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "setemoji":
-			a.handleSetEmojiCommand(ctx, msg.Chat.ID, args)
+			a.handleSetEmojiCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "logs", "log":
 			a.showLogsView(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		case "devname":
-			a.handleDevNameCommand(ctx, msg.Chat.ID, args)
+			a.handleDevNameCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "say":
 			if args != "" {
 				log.Printf("[tts] Speaking: %s", args)
 				if err := a.spk.PlayTTS(args); err != nil {
 					log.Printf("[tts] Error: %v", err)
-					_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err), msg.MessageID)
 				} else {
-					_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: %s", args))
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: %s", args), msg.MessageID)
 				}
+			} else {
+				a.sendEphemeral(ctx, msg.Chat.ID, "ℹ️ Использование: `/say <текст>`", msg.MessageID)
 			}
 		case "play":
 			if args != "" {
 				log.Printf("[sound] Playing: %s", args)
 				if err := a.spk.PlaySound(args); err == nil {
-					_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("📢 Воспроизводится: %s", args))
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("📢 Воспроизводится: %s", args), msg.MessageID)
 				} else {
 					log.Printf("[sound] Error: %v", err)
-					_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка: %v", err))
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка: %v", err), msg.MessageID)
 				}
 			}
 		case "listen":
@@ -183,19 +210,21 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 					sec = s
 				}
 			}
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 			a.runListenCommand(ctx, msg.Chat.ID, sec)
 		case "vol":
 			if args != "" {
 				if v, err := strconv.Atoi(args); err == nil {
 					_ = a.spk.SetVolume(v)
-					_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🔊 Громкость установлена: %d%%", v))
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("🔊 Громкость установлена: %d%%", v), msg.MessageID)
 				}
 			}
 		case "reboot":
-			_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, "🔄 Перезагрузка колонки...")
+			a.sendEphemeral(ctx, msg.Chat.ID, "🔄 Перезагрузка колонки...", msg.MessageID)
 			_ = a.spk.Reboot()
 		default:
 			a.sendMainMenu(ctx, msg.Chat.ID)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
 		}
 		return
 	}
@@ -204,9 +233,9 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 	log.Printf("[tts] Plain text to speech: %s", text)
 	if err := a.spk.PlayTTS(text); err != nil {
 		log.Printf("[tts] Error: %v", err)
-		_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
+		a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err), msg.MessageID)
 	} else {
-		_, _ = a.tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: \"%s\"", text))
+		a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: \"%s\"", text), msg.MessageID)
 	}
 }
 
@@ -521,16 +550,17 @@ func (a *App) scheduleTimer(chatID int64, dur time.Duration, label string) {
 	})
 }
 
-func (a *App) handleTimerCommand(ctx context.Context, chatID int64, args string) {
+func (a *App) handleTimerCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
 	if args == "" {
 		a.showTimerMenu(ctx, chatID, 0)
+		a.tg.DeleteAfter(3*time.Second, chatID, userMsgID)
 		return
 	}
 
 	parts := strings.SplitN(args, " ", 2)
 	dur, err := time.ParseDuration(parts[0])
 	if err != nil {
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "❌ Неверный формат времени. Пример: `/timer 15m Пицца` (доступно: 30s, 5m, 1h)")
+		a.sendEphemeral(ctx, chatID, "❌ Неверный формат времени. Пример: `/timer 15m Пицца` (доступно: 30s, 5m, 1h)", userMsgID)
 		return
 	}
 
@@ -540,12 +570,12 @@ func (a *App) handleTimerCommand(ctx context.Context, chatID int64, args string)
 	}
 
 	a.scheduleTimer(chatID, dur, label)
-	_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("⏱ Таймер *\"%s\"* установлен на *%s* (сработает в %s)", label, dur, time.Now().Add(dur).Format("15:04:05")))
+	a.sendEphemeral(ctx, chatID, fmt.Sprintf("⏱ Таймер *\"%s\"* установлен на *%s* (сработает в %s)", label, dur, time.Now().Add(dur).Format("15:04:05")), userMsgID)
 }
 
-func (a *App) handleAlarmCommand(ctx context.Context, chatID int64, args string) {
+func (a *App) handleAlarmCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
 	if args == "" {
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "ℹ️ Использование: `/alarm 08:30 Подъем!`")
+		a.sendEphemeral(ctx, chatID, "ℹ️ Использование: `/alarm 08:30 Подъем!`", userMsgID)
 		return
 	}
 
@@ -559,7 +589,7 @@ func (a *App) handleAlarmCommand(ctx context.Context, chatID int64, args string)
 	now := time.Now()
 	parsedTime, err := time.ParseInLocation("15:04", timeStr, now.Location())
 	if err != nil {
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "❌ Неверный формат времени. Используйте `ЧЧ:ММ`, например: `/alarm 07:30`")
+		a.sendEphemeral(ctx, chatID, "❌ Неверный формат времени. Используйте `ЧЧ:ММ`, например: `/alarm 07:30`", userMsgID)
 		return
 	}
 
@@ -579,7 +609,7 @@ func (a *App) handleAlarmCommand(ctx context.Context, chatID int64, args string)
 		_, _ = a.tg.SendTextMessage(context.Background(), chatID, notif)
 	})
 
-	_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("⏰ Будильник *\"%s\"* установлен на *%s* (через %s)", label, target.Format("15:04"), dur.Round(time.Minute)))
+	a.sendEphemeral(ctx, chatID, fmt.Sprintf("⏰ Будильник *\"%s\"* установлен на *%s* (через %s)", label, target.Format("15:04"), dur.Round(time.Minute)), userMsgID)
 }
 
 // -------------------------------------------------------------
@@ -657,10 +687,10 @@ func (a *App) showPresenceMenu(ctx context.Context, chatID int64, msgID int64) {
 	}
 }
 
-func (a *App) handleDevNameCommand(ctx context.Context, chatID int64, args string) {
+func (a *App) handleDevNameCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
 	parts := strings.SplitN(args, " ", 2)
 	if len(parts) < 2 {
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "ℹ️ Использование: `/devname <MAC-адрес> <Название устройства>`\nПример: `/devname 24:0f:5e:02:02:9a Роутер`")
+		a.sendEphemeral(ctx, chatID, "ℹ️ Использование: `/devname <MAC-адрес> <Название устройства>`\nПример: `/devname 24:0f:5e:02:02:9a Роутер`", userMsgID)
 		return
 	}
 
@@ -671,7 +701,7 @@ func (a *App) handleDevNameCommand(ctx context.Context, chatID int64, args strin
 		_ = a.scanner.SaveKnownDevices(a.cfg.DevicesFile)
 	}
 
-	_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("✅ Устройству `%s` присвоено имя: *%s*", presence.NormalizeMAC(mac), name))
+	a.sendEphemeral(ctx, chatID, fmt.Sprintf("✅ Устройству `%s` присвоено имя: *%s*", presence.NormalizeMAC(mac), name), userMsgID)
 }
 
 // -------------------------------------------------------------
@@ -829,14 +859,14 @@ func (a *App) showEmojiMenu(ctx context.Context, chatID int64, msgID int64) {
 	}
 }
 
-func (a *App) handleSetEmojiCommand(ctx context.Context, chatID int64, args string) {
+func (a *App) handleSetEmojiCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
 		help := "🎨 *Настройка эмодзи кнопок:*\n\n" +
 			"Использование: `/setemoji <кнопка> <эмодзи>`\n" +
 			"Пример: `/setemoji timer ⏳` или `/setemoji status 💎`\n\n" +
 			"*Доступные кнопки:* `status`, `intercom`, `soundboard`, `tts`, `volume`, `siren`, `timer`, `presence`, `netdiag`, `dialogs`, `system`, `emoji`, `back`"
-		_, _ = a.tg.SendTextMessage(ctx, chatID, help)
+		a.sendEphemeral(ctx, chatID, help, userMsgID)
 		return
 	}
 
@@ -844,7 +874,7 @@ func (a *App) handleSetEmojiCommand(ctx context.Context, chatID int64, args stri
 	emoji := parts[1]
 	a.tm.SetIcon(ui.ButtonID(btnKey), emoji)
 
-	_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("✅ Для кнопки `%s` установлен эмодзи: %s\nГлавное меню обновлено!", btnKey, emoji))
+	a.sendEphemeral(ctx, chatID, fmt.Sprintf("✅ Для кнопки `%s` установлен эмодзи: %s\nГлавное меню обновлено!", btnKey, emoji), userMsgID)
 }
 
 func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
@@ -941,18 +971,21 @@ func (a *App) getRecentLogs(linesCount int) string {
 func (a *App) runListenCommand(ctx context.Context, chatID int64, sec int) {
 	go func() {
 		log.Printf("[listen] Recording %d seconds...", sec)
-		_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("👂 Запись аудио из комнаты (%d сек)...", sec))
+		m1, _ := a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("👂 Запись аудио из комнаты (%d сек)...", sec))
 		filePath, err := a.spk.RecordRoom(sec)
+		if m1 != nil {
+			_ = a.tg.DeleteMessage(ctx, chatID, m1.MessageID)
+		}
 		if err != nil {
 			log.Printf("[listen] RecordRoom error: %v", err)
-			_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка записи: %v", err))
+			a.sendEphemeral(ctx, chatID, fmt.Sprintf("❌ Ошибка записи: %v", err), 0)
 			return
 		}
 		log.Printf("[listen] Sending audio file: %s", filePath)
 		_, err = a.tg.SendAudioFile(ctx, chatID, filePath, fmt.Sprintf("🎙️ Аудиозапись из комнаты (%d сек)", sec), fmt.Sprintf("Запись %d сек", sec), "Яндекс Станция Mini", nil)
 		if err != nil {
 			log.Printf("[listen] SendAudioFile error: %v", err)
-			_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки аудио: %v", err))
+			a.sendEphemeral(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки аудио: %v", err), 0)
 		}
 	}()
 }
@@ -961,7 +994,7 @@ func (a *App) handleVoiceIntercom(ctx context.Context, u *telegram.Update) {
 	chatID := u.ChatID()
 	go func() {
 		log.Printf("[intercom] Processing incoming voice message from chat %d", chatID)
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "🎙️ Голосовое сообщение принято! Озвучиваю в комнате...")
+		m1, _ := a.tg.SendTextMessage(ctx, chatID, "🎙️ Голосовое сообщение принято! Озвучиваю в комнате...")
 
 		// 1. Play chime alert
 		_ = a.spk.PlaySound("telegram")
@@ -989,19 +1022,28 @@ func (a *App) handleVoiceIntercom(ctx context.Context, u *telegram.Update) {
 		time.Sleep(500 * time.Millisecond)
 
 		// 3. Record response from room
-		_, _ = a.tg.SendTextMessage(ctx, chatID, "👂 Записываю ответ из комнаты (5 сек)...")
+		m2, _ := a.tg.SendTextMessage(ctx, chatID, "👂 Записываю ответ из комнаты (5 сек)...")
 		log.Printf("[intercom] Recording 5s room response...")
 		recFile, err := a.spk.RecordRoom(5)
+
+		// Delete intermediate notifications to keep chat clean
+		if m1 != nil {
+			_ = a.tg.DeleteMessage(ctx, chatID, m1.MessageID)
+		}
+		if m2 != nil {
+			_ = a.tg.DeleteMessage(ctx, chatID, m2.MessageID)
+		}
+
 		if err == nil {
 			log.Printf("[intercom] Sending recorded reply: %s", recFile)
 			_, err = a.tg.SendAudioFile(ctx, chatID, recFile, "🎙️ Ответ из комнаты", "Ответ из комнаты", "Яндекс Станция Mini", nil)
 			if err != nil {
 				log.Printf("[intercom] SendAudioFile error: %v", err)
-				_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки ответа: %v", err))
+				a.sendEphemeral(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки ответа: %v", err), 0)
 			}
 		} else {
 			log.Printf("[intercom] RecordRoom error: %v", err)
-			_, _ = a.tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка записи ответа: %v", err))
+			a.sendEphemeral(ctx, chatID, fmt.Sprintf("❌ Ошибка записи ответа: %v", err), 0)
 		}
 	}()
 }
