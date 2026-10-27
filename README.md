@@ -54,8 +54,9 @@
 
 ### ⚙️ Системный контроль
 * **📶 Bluetooth-аудиоприемник (A2DP Sink) (`/bt`):**
-  * Мгновенный запуск/остановка штатного Bluetooth-стека (`bsa_server` на контроллере Broadcom BCM43430) в один клик из Telegram.
-  * Позволяет использовать Станцию Mini как обычную беспроводную Bluetooth-колонку для смартфона или ПК.
+  * Полноценная интеграция с Broadcom BSA стеком: запуск `bsa_server`, регистрация A2DP Sink через `bt_demo` и перевод радиомодуля BCM43430 в режим обнаружения (Discoverable & Connectable).
+  * Динамическое отображение имени колонки для поиска (`Yandex Station Mini <XXXX>`).
+  * Звук со смартфона, ноутбука или планшета воспроизводится напрямую через встроенный усилитель и динамик Станции Mini.
 * **📊 Fastfetch & Телеметрия (`/status`):** вывод характеристик системы, ASCII-логотипа, температуры CPU Amlogic A113X, Load Average и статуса памяти.
 * **📋 Live Logs (`/logs`):** просмотр последних 20 строк журнала `/data/telegram-bot/bot.log` с кнопкой обновления в реальном времени.
 * **🧹 Очистка RAM:** сброс буферов оперативной памяти (`echo 3 > /proc/sys/vm/drop_caches`).
@@ -83,14 +84,6 @@ yandex-station-mini-bot/
 │   │   ├── record_linux.go  # Аппаратный захват PDM-микрофонов (Linux ALSA MMAP)
 │   │   └── record_other.go  # Заглушка для сборки и тестов на Windows/macOS
 │   └── telegram/            # Чистый клиент Telegram Bot API без внешних SDK
-├── scripts/
-│   └── start.sh             # Демон-скрипт (start/stop/restart/status/logs)
-├── sounds/                  # Набор звуков для саундборда (*.wav)
-├── config.example.json      # Пример конфигурационного файла
-├── AGENTS.md                # Стандарты разработки и Quality Gates для AI-агентов
-├── go.mod
-└── README.md
-```
 ├── scripts/
 │   └── start.sh             # Демон-скрипт (start/stop/restart/status/logs)
 ├── sounds/                  # Набор звуков для саундборда (*.wav)

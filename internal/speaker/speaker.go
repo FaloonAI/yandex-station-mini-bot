@@ -1,10 +1,12 @@
 package speaker
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,6 +48,11 @@ type Controller struct {
 	quasarLogs string
 	gesturesOn bool
 	currentEQ  string
+
+	btMu      sync.Mutex
+	btCmd     *exec.Cmd
+	btStdin   io.WriteCloser
+	btRunning bool
 }
 
 func NewController(soundsDir, scriptsDir, quasarLogs string) *Controller {
@@ -411,12 +418,18 @@ func (c *Controller) Reboot() error {
 }
 
 // -------------------------------------------------------------
-// Bluetooth (A2DP Sink / bsa_server) Stack Control
+// Bluetooth (A2DP Sink / Broadcom BSA Stack) Control
 // -------------------------------------------------------------
 
 // IsBluetoothEnabled checks if the Broadcom Bluetooth stack (bsa_server) is currently running.
 func (c *Controller) IsBluetoothEnabled() bool {
 	out, err := exec.Command("pidof", "bsa_server").Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+// IsBluetoothDiscoverable checks if the bt_demo sink client is active.
+func (c *Controller) IsBluetoothDiscoverable() bool {
+	out, err := exec.Command("pidof", "bt_demo").Output()
 	return err == nil && len(strings.TrimSpace(string(out))) > 0
 }
 
@@ -429,13 +442,109 @@ func (c *Controller) GetBluetoothPID() string {
 	return strings.TrimSpace(string(out))
 }
 
-// SetBluetoothEnabled starts (1) or stops (0) the Broadcom Bluetooth BSA server.
-func (c *Controller) SetBluetoothEnabled(enable bool) error {
-	arg := "0"
-	if enable {
-		arg = "1"
+// GetBluetoothDeviceName returns the broadcast name of the station for pairing.
+func (c *Controller) GetBluetoothDeviceName() string {
+	data, err := os.ReadFile("/vendor/bsa/bt_config.xml")
+	if err != nil {
+		return "Yandex Station Mini"
 	}
-	return exec.Command("/system/vendor/quasar/bsa_server_run.sh", arg).Run()
+	re := regexp.MustCompile(`<local_name>(.*?)</local_name>`)
+	m := re.FindSubmatch(data)
+	if len(m) > 1 && len(m[1]) > 0 {
+		return string(m[1])
+	}
+	return "Yandex Station Mini"
+}
+
+// SetBluetoothEnabled starts or stops the Broadcom Bluetooth BSA stack and A2DP sink.
+func (c *Controller) SetBluetoothEnabled(enable bool) error {
+	c.btMu.Lock()
+	defer c.btMu.Unlock()
+
+	if !enable {
+		if c.btStdin != nil {
+			_, _ = fmt.Fprintln(c.btStdin, "99")
+			_ = c.btStdin.Close()
+			c.btStdin = nil
+		}
+		if c.btCmd != nil && c.btCmd.Process != nil {
+			_ = c.btCmd.Process.Kill()
+			c.btCmd = nil
+		}
+		c.btRunning = false
+
+		_ = exec.Command("killall", "-9", "bt_demo").Run()
+		_ = exec.Command("/system/workdir/bin/localSendSocket", "/tmp/RequestIOGuard", "GNOTIFY=BTSYNC_PAIRING_END").Run()
+		_ = exec.Command("/system/vendor/quasar/bsa_server_run.sh", "0").Run()
+		slog.Info("[Bluetooth] Stack disabled")
+		return nil
+	}
+
+	// 1. Ensure bt_config.xml is configured for discoverable and connectable mode
+	_ = exec.Command("sh", "-c", "sed -i 's/<visible>0<\\/visible>/<visible>1<\\/visible>/g' /vendor/bsa/bt_config.xml; sed -i 's/<connectable>0<\\/connectable>/<connectable>1<\\/connectable>/g' /vendor/bsa/bt_config.xml").Run()
+
+	// 2. Start bsa_server if not already running
+	if out, err := exec.Command("pidof", "bsa_server").Output(); err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		if err := exec.Command("/system/vendor/quasar/bsa_server_run.sh", "1").Run(); err != nil {
+			return fmt.Errorf("failed to start bsa_server: %w", err)
+		}
+		time.Sleep(1500 * time.Millisecond)
+	}
+
+	// 3. Notify RequestIOGuard to enter pairing mode and switch UART clocks
+	_ = exec.Command("/system/workdir/bin/localSendSocket", "/tmp/RequestIOGuard", "GNOTIFY=BTSYNC_PAIRING_BEGIN").Run()
+
+	// 4. Kill any orphan bt_demo processes
+	_ = exec.Command("killall", "-9", "bt_demo").Run()
+	time.Sleep(200 * time.Millisecond)
+
+	// 5. Spawn bt_demo with interactive stdin
+	cmd := exec.Command("/system/workdir/bin/bt_demo")
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/system/vendor/quasar/libs")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to open bt_demo stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("failed to open bt_demo stdout: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("failed to start bt_demo: %w", err)
+	}
+
+	c.btCmd = cmd
+	c.btStdin = stdin
+	c.btRunning = true
+
+	// Monitor bt_demo output in background
+	go func(r io.Reader) {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "sink") || strings.Contains(line, "volume") || strings.Contains(line, "Dev:") || strings.Contains(line, "connected") {
+				slog.Info("[Bluetooth]", "event", line)
+			}
+		}
+	}(stdout)
+
+	// Send Sink Service start (1) and Connectable/Discoverable (3 -> 1, 1) commands progressively
+	go func(in io.Writer) {
+		time.Sleep(600 * time.Millisecond)
+		_, _ = fmt.Fprintln(in, "1") // 1 => Start Sink Service
+		time.Sleep(800 * time.Millisecond)
+		_, _ = fmt.Fprintln(in, "3") // 3 => Set connectable/discoverable
+		time.Sleep(400 * time.Millisecond)
+		_, _ = fmt.Fprintln(in, "1") // Choose discoverable: 1
+		time.Sleep(400 * time.Millisecond)
+		_, _ = fmt.Fprintln(in, "1") // Choose connectable: 1
+		slog.Info("[Bluetooth] Initialized A2DP Sink and set Discoverable/Connectable")
+	}(stdin)
+
+	return nil
 }
 
 // RestartBluetooth cleanly cycles the Bluetooth stack.

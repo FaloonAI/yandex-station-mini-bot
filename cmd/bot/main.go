@@ -456,21 +456,21 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 		a.showBluetoothMenu(ctx, chatID, msgID)
 
 	case data == "bt:on":
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Запуск стека Bluetooth...")
 		_ = a.spk.SetBluetoothEnabled(true)
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Bluetooth включен!")
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond)
 		a.showBluetoothMenu(ctx, chatID, msgID)
 
 	case data == "bt:off":
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Остановка Bluetooth...")
 		_ = a.spk.SetBluetoothEnabled(false)
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Bluetooth выключен!")
 		time.Sleep(500 * time.Millisecond)
 		a.showBluetoothMenu(ctx, chatID, msgID)
 
 	case data == "bt:restart":
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Перезапуск стека Bluetooth...")
 		_ = a.spk.RestartBluetooth()
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Стек Bluetooth перезапущен!")
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond)
 		a.showBluetoothMenu(ctx, chatID, msgID)
 
 	case data == "nav:tts":
@@ -1097,11 +1097,18 @@ func (a *App) showNightModeMenu(ctx context.Context, chatID int64, msgID int64) 
 
 func (a *App) showBluetoothMenu(ctx context.Context, chatID int64, msgID int64) {
 	enabled := a.spk.IsBluetoothEnabled()
+	discoverable := a.spk.IsBluetoothDiscoverable()
+	devName := a.spk.GetBluetoothDeviceName()
+
 	status := "выключен ⚪"
 	pidStr := ""
 	if enabled {
 		pid := a.spk.GetBluetoothPID()
-		status = "ВКЛЮЧЕН 🟢"
+		if discoverable {
+			status = "ВКЛЮЧЕН (Видим для сопряжения) 🟢"
+		} else {
+			status = "ВКЛЮЧЕН (Запуск стека...) 🟡"
+		}
 		if pid != "" {
 			pidStr = fmt.Sprintf(" (PID: %s)", pid)
 		}
@@ -1109,10 +1116,15 @@ func (a *App) showBluetoothMenu(ctx context.Context, chatID int64, msgID int64) 
 
 	text := fmt.Sprintf("📶 *Bluetooth-аудиоприемник (A2DP Sink)*\n\n"+
 		"• Состояние стека: *%s*%s\n"+
-		"• Аппаратный контроллер: *Broadcom BCM43430*\n"+
-		"• Сервер: `/system/workdir/bin/bsa_server`\n\n"+
-		"💡 При включении Bluetooth Станция Mini становится доступна для сопряжения со смартфоном, планшетом или ноутбуком как беспроводная аудиоколонка.",
-		status, pidStr)
+		"• Имя устройства: `%s`\n"+
+		"• Режим: *Беспроводной динамик (A2DP Sink)*\n"+
+		"• Контроллер: *Broadcom BCM43430 (UART)*\n\n"+
+		"📱 *Как подключиться:*\n"+
+		"1. Нажмите «🟢 Включить Bluetooth» ниже.\n"+
+		"2. Откройте настройки Bluetooth на смартфоне или ПК.\n"+
+		"3. В списке устройств выберите *%s* и выполните сопряжение.\n"+
+		"4. Звук с вашего устройства пойдет прямо через динамик Станции!",
+		status, pidStr, devName, devName)
 
 	toggleBtn := telegram.NewButton("🟢 Включить Bluetooth", "bt:on")
 	if enabled {
