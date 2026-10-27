@@ -20,7 +20,7 @@ import (
 
 const (
 	defaultBaseURL       = "https://api.telegram.org/bot"
-	defaultPollTimeout   = 25 // seconds for getUpdates long polling
+	defaultPollTimeout   = 10 // seconds for getUpdates long polling (fits within VPN/router NAT idle timeouts)
 	defaultReqTimeout    = 30 * time.Second
 	defaultUploadTimeout = 120 * time.Second
 )
@@ -256,8 +256,8 @@ func (c *Client) StartPolling(ctx context.Context, handler func(ctx context.Cont
 			select {
 			case <-time.After(backoff):
 				backoff *= 2
-				if backoff > 20*time.Second {
-					backoff = 20 * time.Second
+				if backoff > 2*time.Second {
+					backoff = 2 * time.Second
 				}
 			case <-ctx.Done():
 				return ctx.Err()

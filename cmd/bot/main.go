@@ -17,16 +17,12 @@ import (
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/presence"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/speaker"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/telegram"
-	"github.com/FaloonAI/yandex-station-mini-bot/internal/timer"
-	"github.com/FaloonAI/yandex-station-mini-bot/internal/ui"
 )
 
 type App struct {
 	cfg     *config.Config
 	spk     *speaker.Controller
 	tg      *telegram.Client
-	tm      *ui.ThemeManager
-	timer   *timer.Manager
 	scanner *presence.Scanner
 	diag    *netdiag.Diagnostics
 }
@@ -48,8 +44,6 @@ func main() {
 		log.Fatalf("Failed to create telegram client: %v", err)
 	}
 
-	themeMgr := ui.NewThemeManager(cfg.Theme)
-	timerMgr := timer.NewManager()
 	scanner := presence.NewScanner(presence.WithSubnet(cfg.Subnet))
 	if cfg.DevicesFile != "" {
 		_ = scanner.LoadKnownDevices(cfg.DevicesFile)
@@ -60,8 +54,6 @@ func main() {
 		cfg:     cfg,
 		spk:     spk,
 		tg:      tg,
-		tm:      themeMgr,
-		timer:   timerMgr,
 		scanner: scanner,
 		diag:    diag,
 	}
@@ -75,7 +67,6 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		log.Printf("Received signal %v, shutting down...", sig)
-		app.timer.Close()
 		cancel()
 	}()
 
@@ -158,10 +149,6 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 		case "status", "fastfetch":
 			a.sendFastfetchStatus(ctx, msg.Chat.ID, 0)
 			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
-		case "timer":
-			a.handleTimerCommand(ctx, msg.Chat.ID, args, msg.MessageID)
-		case "alarm":
-			a.handleAlarmCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "presence", "whoishome":
 			a.showPresenceMenu(ctx, msg.Chat.ID, 0)
 			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
@@ -171,11 +158,6 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 		case "speedtest":
 			a.runSpeedtest(ctx, msg.Chat.ID, 0)
 			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
-		case "emoji", "theme":
-			a.showEmojiMenu(ctx, msg.Chat.ID, 0)
-			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
-		case "setemoji":
-			a.handleSetEmojiCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "logs", "log":
 			a.showLogsView(ctx, msg.Chat.ID, 0)
 			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
@@ -257,9 +239,6 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 	case data == "nav:status":
 		a.sendFastfetchStatus(ctx, chatID, msgID)
 
-	case data == "nav:timer":
-		a.showTimerMenu(ctx, chatID, msgID)
-
 	case data == "nav:presence":
 		a.showPresenceMenu(ctx, chatID, msgID)
 
@@ -269,59 +248,25 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 	case data == "net:speedtest":
 		a.runSpeedtest(ctx, chatID, msgID)
 
-	case data == "nav:emoji" || data == "nav:theme":
-		a.showEmojiMenu(ctx, chatID, msgID)
-
-	case data == "emoji:reset":
-		a.tm.ResetDefaults()
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Эмодзи сброшены по умолчанию")
-		a.showEmojiMenu(ctx, chatID, msgID)
-
-	case strings.HasPrefix(data, "timer:add:"):
-		durStr := strings.TrimPrefix(data, "timer:add:")
-		dur, err := time.ParseDuration(durStr)
-		if err == nil {
-			label := fmt.Sprintf("Таймер на %s", durStr)
-			a.scheduleTimer(chatID, dur, label)
-			_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("Таймер на %s запущен!", durStr))
-		}
-		a.showTimerMenu(ctx, chatID, msgID)
-
-	case strings.HasPrefix(data, "timer:cancel:"):
-		id := strings.TrimPrefix(data, "timer:cancel:")
-		if a.timer.Cancel(id) {
-			_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Таймер отменен")
-		}
-		a.showTimerMenu(ctx, chatID, msgID)
-
-	case data == "timer:cancel_all":
-		active := a.timer.ListActive()
-		for _, item := range active {
-			a.timer.Cancel(item.ID)
-		}
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Все таймеры отменены")
-		a.showTimerMenu(ctx, chatID, msgID)
-
 	case data == "nav:intercom":
-		text := fmt.Sprintf("%s *Рация & Прослушка комнаты*\n\n"+
-			"• *Рация:* отправьте голосовое сообщение в этот чат — колонка озвучит его в комнате и сразу запишет 5 секунд ответа.\n\n"+
-			"• *Прослушка:* выберите длительность записи ниже:", a.tm.Icon(ui.BtnIntercom))
+		text := "🎙️ *Рация & Прослушка комнаты*\n\n" +
+			"• *Рация:* отправьте голосовое сообщение в этот чат — колонка озвучит его в комнате и сразу запишет 5 секунд ответа.\n\n" +
+			"• *Прослушка:* выберите длительность записи ниже:"
 		markup := telegram.NewKeyboardBuilder().
 			Row(telegram.NewButton("👂 Послушать 5 сек", "rec:5"), telegram.NewButton("👂 Послушать 10 сек", "rec:10")).
 			Row(telegram.NewButton("👂 Послушать 15 сек", "rec:15"), telegram.NewButton("👂 Послушать 30 сек", "rec:30")).
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+			Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 			Build()
 		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 
 	case data == "nav:soundboard":
-		text := fmt.Sprintf("%s *Саундборд*\n\nВыберите звук для мгновенного воспроизведения на колонке:", a.tm.Icon(ui.BtnSoundboard))
+		text := "📢 *Саундборд*\n\nВыберите звук для мгновенного воспроизведения на колонке:"
 		markup := telegram.NewKeyboardBuilder().
-			Row(telegram.NewButton("📢 Airhorn", "snd:airhorn"), telegram.NewButton("🚨 Alarm", "snd:alarm_loud")).
-			Row(telegram.NewButton("🎺 Bruh", "snd:bruh"), telegram.NewButton("🔔 Discord", "snd:discord")).
-			Row(telegram.NewButton("💨 Fart", "snd:fart"), telegram.NewButton("🪈 Metal Pipe", "snd:metal_pipe")).
-			Row(telegram.NewButton("🎵 Rickroll", "snd:rickroll"), telegram.NewButton("🔊 Win XP", "snd:winxp")).
-			Row(telegram.NewButton("⏹ Остановить звук", "snd:stop")).
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+			Row(telegram.NewButton("📢 Airhorn", "snd:airhorn"), telegram.NewButton("🎺 Bruh", "snd:bruh")).
+			Row(telegram.NewButton("🔔 Discord", "snd:discord"), telegram.NewButton("💨 Fart", "snd:fart")).
+			Row(telegram.NewButton("🪈 Metal Pipe", "snd:metal_pipe"), telegram.NewButton("🎵 Rickroll", "snd:rickroll")).
+			Row(telegram.NewButton("🔊 Win XP", "snd:winxp"), telegram.NewButton("⏹ Остановить", "snd:stop")).
+			Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 			Build()
 		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 
@@ -329,28 +274,16 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 		a.showVolumeMenu(ctx, chatID, msgID)
 
 	case data == "nav:tts":
-		text := fmt.Sprintf("%s *Синтез речи (TTS)*\n\n"+
-			"Просто напишите любой текст в чат или используйте команду:\n`/say Привет, мир!`\n\nКолонка мгновенно произнесет его приятным голосом.", a.tm.Icon(ui.BtnTTS))
+		text := "🔊 *Синтез речи (TTS)*\n\n" +
+			"Просто напишите любой текст в чат или используйте команду:\n`/say Привет, мир!`\n\nКолонка мгновенно произнесет его приятным голосом."
 		markup := telegram.NewKeyboardBuilder().
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
-			Build()
-		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
-
-	case data == "nav:alarm":
-		statusText := "выключена ⚪"
-		if a.spk.IsSirenActive() {
-			statusText = "АКТИВНА 🔴"
-		}
-		text := fmt.Sprintf("%s *Охранная сирена*\n\nТекущее состояние: *%s*\n\nПри включении колонка выкрутит громкость на 100%% и будет непрерывно выть сиреной.", a.tm.Icon(ui.BtnSiren), statusText)
-		markup := telegram.NewKeyboardBuilder().
-			Row(telegram.NewButton("🚨 Включить сирену", "siren:on"), telegram.NewButton("🛑 Выключить", "siren:off")).
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+			Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 			Build()
 		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 
 	case data == "nav:dialogs":
 		dialogs, err := a.spk.GetLatestDialogs(6)
-		text := fmt.Sprintf("%s *История диалогов с Алисой:*\n\n", a.tm.Icon(ui.BtnDialogs))
+		text := "💬 *История диалогов с Алисой:*\n\n"
 		if err != nil || len(dialogs) == 0 {
 			text += "_(Диалогов пока нет или логи пусты)_"
 		} else {
@@ -360,7 +293,7 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 		}
 		markup := telegram.NewKeyboardBuilder().
 			Row(telegram.NewButton("🔄 Обновить", "nav:dialogs")).
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+			Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 			Build()
 		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 
@@ -406,18 +339,6 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 		_ = a.spk.SetMute(!muted)
 		a.showVolumeMenu(ctx, chatID, msgID)
 
-	case data == "siren:on":
-		a.spk.StartSiren()
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Сирена включена!")
-		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, "🚨 *Охранная сирена АКТИВНА 🔴*", telegram.ParseModeMarkdown,
-			telegram.NewKeyboardBuilder().Row(telegram.NewButton("🛑 Выключить сирену", "siren:off"), telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).Build())
-
-	case data == "siren:off":
-		a.spk.StopSiren()
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Сирена выключена")
-		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, "⚪ *Охранная сирена выключена*", telegram.ParseModeMarkdown,
-			telegram.NewKeyboardBuilder().Row(telegram.NewButton("🚨 Включить сирену", "siren:on"), telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).Build())
-
 	case data == "gesture:off":
 		_ = a.spk.SetGesturesEnabled(false)
 		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Жесты заблокированы")
@@ -450,13 +371,12 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 
 func (a *App) getMainMenuMarkup() *telegram.InlineKeyboardMarkup {
 	return telegram.NewKeyboardBuilder().
-		Row(telegram.NewButton(a.tm.Format(ui.BtnStatus, "Статус & Fastfetch"), "nav:status")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnIntercom, "Рация & Прослушка"), "nav:intercom"), telegram.NewButton(a.tm.Format(ui.BtnSoundboard, "Саундборд"), "nav:soundboard")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnTTS, "Озвучить текст"), "nav:tts"), telegram.NewButton(a.tm.Format(ui.BtnVolume, "Громкость"), "nav:volume")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnTimer, "Таймеры & Будильники"), "nav:timer"), telegram.NewButton(a.tm.Format(ui.BtnPresence, "Кто дома?"), "nav:presence")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnNetDiag, "Сеть & Пинг"), "nav:netdiag"), telegram.NewButton(a.tm.Format(ui.BtnSiren, "Охранная сирена"), "nav:alarm")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnEmoji, "Эмодзи кнопок"), "nav:emoji"), telegram.NewButton(a.tm.Format(ui.BtnDialogs, "Диалоги"), "nav:dialogs")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnSystem, "Управление системой"), "nav:system")).
+		Row(telegram.NewButton("📊 Статус & Fastfetch", "nav:status")).
+		Row(telegram.NewButton("🎙️ Рация & Прослушка", "nav:intercom"), telegram.NewButton("📢 Саундборд", "nav:soundboard")).
+		Row(telegram.NewButton("🔊 Озвучить текст", "nav:tts"), telegram.NewButton("🎚️ Громкость", "nav:volume")).
+		Row(telegram.NewButton("👥 Кто дома?", "nav:presence"), telegram.NewButton("📶 Сеть & Пинг", "nav:netdiag")).
+		Row(telegram.NewButton("💬 Диалоги с Алисой", "nav:dialogs")).
+		Row(telegram.NewButton("⚙️ Управление системой", "nav:system")).
 		Build()
 }
 
@@ -477,7 +397,7 @@ func (a *App) sendFastfetchStatus(ctx context.Context, chatID int64, editMsgID i
 	text := fmt.Sprintf("```\n%s\n```\n%s", ff, wifi)
 	markup := telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("🔄 Обновить", "nav:status")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 
 	if editMsgID > 0 {
@@ -488,131 +408,6 @@ func (a *App) sendFastfetchStatus(ctx context.Context, chatID int64, editMsgID i
 }
 
 // -------------------------------------------------------------
-// Timer & Alarm UI
-// -------------------------------------------------------------
-
-func (a *App) showTimerMenu(ctx context.Context, chatID int64, msgID int64) {
-	active := a.timer.ListActive()
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s *Таймеры & Будильники*\n\n", a.tm.Icon(ui.BtnTimer)))
-
-	if len(active) == 0 {
-		sb.WriteString("_(Активных таймеров и будильников нет)_\n\n")
-	} else {
-		sb.WriteString("*Активные таймеры:*\n")
-		for _, item := range active {
-			typeIcon := "⏱"
-			if item.IsAlarm {
-				typeIcon = "⏰"
-			}
-			rem := item.Remaining.Round(time.Second)
-			sb.WriteString(fmt.Sprintf("• %s *%s*: осталось `%s` (до %s)\n", typeIcon, item.Label, rem, item.Target.Format("15:04:05")))
-		}
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString("💡 *Быстрый запуск таймера:* выберите кнопки ниже\n")
-	sb.WriteString("✍️ *Команды:* `/timer 15m Пицца`, `/alarm 08:30 Подъем`")
-
-	builder := telegram.NewKeyboardBuilder().
-		Row(telegram.NewButton("⏱ 1 мин", "timer:add:1m"), telegram.NewButton("⏱ 5 мин", "timer:add:5m"), telegram.NewButton("⏱ 15 мин", "timer:add:15m")).
-		Row(telegram.NewButton("⏱ 30 мин", "timer:add:30m"), telegram.NewButton("⏱ 45 мин", "timer:add:45m"), telegram.NewButton("⏱ 1 час", "timer:add:1h"))
-
-	if len(active) > 0 {
-		builder.Row(telegram.NewButton("❌ Сбросить все таймеры", "timer:cancel_all"))
-	}
-
-	builder.Row(telegram.NewButton("🔄 Обновить", "nav:timer"), telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main"))
-
-	markup := builder.Build()
-	if msgID > 0 {
-		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, sb.String(), telegram.ParseModeMarkdown, markup)
-	} else {
-		_, _ = a.tg.SendMarkdown(ctx, chatID, sb.String(), markup)
-	}
-}
-
-func (a *App) scheduleTimer(chatID int64, dur time.Duration, label string) {
-	target := time.Now().Add(dur)
-	a.timer.AddTimer(dur, label, func() {
-		log.Printf("[timer] Timer triggered: %s", label)
-		// 1. Play alert sound
-		_ = a.spk.PlaySound("telegram")
-		time.Sleep(500 * time.Millisecond)
-
-		// 2. Speak with TTS
-		_ = a.spk.PlayTTS(fmt.Sprintf("Внимание! Таймер завершен: %s", label))
-
-		// 3. Send Telegram notification
-		notif := fmt.Sprintf("⏰ *Таймер завершен!*\n\n📝 *%s*\n🕒 Время: %s", label, target.Format("15:04:05"))
-		_, _ = a.tg.SendTextMessage(context.Background(), chatID, notif)
-	})
-}
-
-func (a *App) handleTimerCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
-	if args == "" {
-		a.showTimerMenu(ctx, chatID, 0)
-		a.tg.DeleteAfter(3*time.Second, chatID, userMsgID)
-		return
-	}
-
-	parts := strings.SplitN(args, " ", 2)
-	dur, err := time.ParseDuration(parts[0])
-	if err != nil {
-		a.sendEphemeral(ctx, chatID, "❌ Неверный формат времени. Пример: `/timer 15m Пицца` (доступно: 30s, 5m, 1h)", userMsgID)
-		return
-	}
-
-	label := "Таймер"
-	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-		label = strings.TrimSpace(parts[1])
-	}
-
-	a.scheduleTimer(chatID, dur, label)
-	a.sendEphemeral(ctx, chatID, fmt.Sprintf("⏱ Таймер *\"%s\"* установлен на *%s* (сработает в %s)", label, dur, time.Now().Add(dur).Format("15:04:05")), userMsgID)
-}
-
-func (a *App) handleAlarmCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
-	if args == "" {
-		a.sendEphemeral(ctx, chatID, "ℹ️ Использование: `/alarm 08:30 Подъем!`", userMsgID)
-		return
-	}
-
-	parts := strings.SplitN(args, " ", 2)
-	timeStr := parts[0]
-	label := "Будильник"
-	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-		label = strings.TrimSpace(parts[1])
-	}
-
-	now := time.Now()
-	parsedTime, err := time.ParseInLocation("15:04", timeStr, now.Location())
-	if err != nil {
-		a.sendEphemeral(ctx, chatID, "❌ Неверный формат времени. Используйте `ЧЧ:ММ`, например: `/alarm 07:30`", userMsgID)
-		return
-	}
-
-	target := time.Date(now.Year(), now.Month(), now.Day(), parsedTime.Hour(), parsedTime.Minute(), 0, 0, now.Location())
-	if target.Before(now) {
-		target = target.Add(24 * time.Hour) // Next day
-	}
-
-	dur := target.Sub(now)
-	a.timer.AddAlarm(target, label, func() {
-		log.Printf("[alarm] Alarm triggered: %s", label)
-		_ = a.spk.PlaySound("alarm_loud")
-		time.Sleep(1 * time.Second)
-		_ = a.spk.PlayTTS(fmt.Sprintf("Доброе утро! Сработал будильник: %s", label))
-
-		notif := fmt.Sprintf("⏰ *Сработал будильник!*\n\n📝 *%s*\n🕒 Время: %s", label, target.Format("15:04"))
-		_, _ = a.tg.SendTextMessage(context.Background(), chatID, notif)
-	})
-
-	a.sendEphemeral(ctx, chatID, fmt.Sprintf("⏰ Будильник *\"%s\"* установлен на *%s* (через %s)", label, target.Format("15:04"), dur.Round(time.Minute)), userMsgID)
-}
-
-// -------------------------------------------------------------
 // Presence Detection UI ("Кто дома?")
 // -------------------------------------------------------------
 
@@ -620,7 +415,7 @@ func (a *App) showPresenceMenu(ctx context.Context, chatID int64, msgID int64) {
 	devices, err := a.scanner.Scan(ctx)
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s *Детектор присутствия (Кто дома?)*\n\n", a.tm.Icon(ui.BtnPresence)))
+	sb.WriteString("👥 *Детектор присутствия (Кто дома?)*\n\n")
 
 	if err != nil {
 		sb.WriteString(fmt.Sprintf("⚠️ Ошибка сканирования сети: %v\n\n", err))
@@ -677,7 +472,7 @@ func (a *App) showPresenceMenu(ctx context.Context, chatID int64, msgID int64) {
 
 	markup := telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("🔄 Сканировать снова", "nav:presence")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 
 	if msgID > 0 {
@@ -713,7 +508,7 @@ func (a *App) showNetDiagMenu(ctx context.Context, chatID int64, msgID int64) {
 	pings, _ := a.diag.PingHosts(ctx)
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s *Сетевая диагностика & Пинг*\n\n", a.tm.Icon(ui.BtnNetDiag)))
+	sb.WriteString("📶 *Сетевая диагностика & Пинг*\n\n")
 
 	if wifi.Connected {
 		signalPercent := 100
@@ -741,7 +536,7 @@ func (a *App) showNetDiagMenu(ctx context.Context, chatID int64, msgID int64) {
 
 	markup := telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("🚀 Запустить тест скорости", "net:speedtest"), telegram.NewButton("🔄 Обновить пинг", "nav:netdiag")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 
 	if msgID > 0 {
@@ -806,75 +601,11 @@ func (a *App) runSpeedtest(ctx context.Context, chatID int64, msgID int64) {
 
 		markup := telegram.NewKeyboardBuilder().
 			Row(telegram.NewButton("🔄 Повторить тест", "net:speedtest"), telegram.NewButton("⬅️ К сети", "nav:netdiag")).
-			Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Главное меню"), "nav:main")).
+			Row(telegram.NewButton("⬅️ Главное меню", "nav:main")).
 			Build()
 
 		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 	}()
-}
-
-// -------------------------------------------------------------
-// Emoji UI Customization
-// -------------------------------------------------------------
-
-func (a *App) showEmojiMenu(ctx context.Context, chatID int64, msgID int64) {
-	current := a.tm.GetTheme()
-
-	text := fmt.Sprintf("%s *Настройка эмодзи кнопок*\n\n"+
-		"Текущие иконки в меню:\n"+
-		"• Статус: %s (`status`)\n"+
-		"• Рация: %s (`intercom`)\n"+
-		"• Саундборд: %s (`soundboard`)\n"+
-		"• Озвучка текста: %s (`tts`)\n"+
-		"• Громкость: %s (`volume`)\n"+
-		"• Охранная сирена: %s (`siren`)\n"+
-		"• Таймеры: %s (`timer`)\n"+
-		"• Кто дома: %s (`presence`)\n"+
-		"• Сеть & Пинг: %s (`netdiag`)\n"+
-		"• Диалоги: %s (`dialogs`)\n"+
-		"• Система: %s (`system`)\n"+
-		"• Эмодзи меню: %s (`emoji`)\n"+
-		"• Назад: %s (`back`)\n\n"+
-		"💡 *Как изменить эмодзи:*\n"+
-		"Отправьте команду в чат:\n"+
-		"`/setemoji <кнопка> <эмодзи>`\n\n"+
-		"_Пример:_ `/setemoji timer ⏳` или `/setemoji status 💎`\n"+
-		"_(Поддерживаются любые стандартные и Telegram Premium эмодзи)_",
-		a.tm.Icon(ui.BtnEmoji),
-		current.Status, current.Intercom, current.Soundboard,
-		current.TTS, current.Volume, current.Siren,
-		current.Timer, current.Presence, current.NetDiag,
-		current.Dialogs, current.System, current.Theme,
-		current.Back)
-
-	markup := telegram.NewKeyboardBuilder().
-		Row(telegram.NewButton("🔄 Сбросить по умолчанию", "emoji:reset")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
-		Build()
-
-	if msgID > 0 {
-		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
-	} else {
-		_, _ = a.tg.SendMarkdown(ctx, chatID, text, markup)
-	}
-}
-
-func (a *App) handleSetEmojiCommand(ctx context.Context, chatID int64, args string, userMsgID int64) {
-	parts := strings.Fields(args)
-	if len(parts) < 2 {
-		help := "🎨 *Настройка эмодзи кнопок:*\n\n" +
-			"Использование: `/setemoji <кнопка> <эмодзи>`\n" +
-			"Пример: `/setemoji timer ⏳` или `/setemoji status 💎`\n\n" +
-			"*Доступные кнопки:* `status`, `intercom`, `soundboard`, `tts`, `volume`, `siren`, `timer`, `presence`, `netdiag`, `dialogs`, `system`, `emoji`, `back`"
-		a.sendEphemeral(ctx, chatID, help, userMsgID)
-		return
-	}
-
-	btnKey := strings.ToLower(parts[0])
-	emoji := parts[1]
-	a.tm.SetIcon(ui.ButtonID(btnKey), emoji)
-
-	a.sendEphemeral(ctx, chatID, fmt.Sprintf("✅ Для кнопки `%s` установлен эмодзи: %s\nГлавное меню обновлено!", btnKey, emoji), userMsgID)
 }
 
 func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
@@ -883,7 +614,7 @@ func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
 	if muted {
 		muteStatus = "ВКЛЮЧЕН (звук заглушен) 🔇"
 	}
-	text := fmt.Sprintf("%s *Управление громкостью*\n\nТекущая громкость: *%d%%*\nРежим Mute: *%s*\n\nВыберите уровень или измените ступенями:", a.tm.Icon(ui.BtnVolume), vol, muteStatus)
+	text := fmt.Sprintf("🎚️ *Управление громкостью*\n\nТекущая громкость: *%d%%*\nРежим Mute: *%s*\n\nВыберите уровень или измените ступенями:", vol, muteStatus)
 
 	muteBtn := telegram.NewButton("🔇 Заглушить (Mute)", "mute:toggle")
 	if muted {
@@ -894,7 +625,7 @@ func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
 		Row(telegram.NewButton("🔉 -10%", "volstep:-10"), telegram.NewButton("🔊 +10%", "volstep:10")).
 		Row(telegram.NewButton("20%", "vol:20"), telegram.NewButton("40%", "vol:40"), telegram.NewButton("60%", "vol:60"), telegram.NewButton("80%", "vol:80"), telegram.NewButton("100%", "vol:100")).
 		Row(muteBtn).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 
 	_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
@@ -905,7 +636,7 @@ func (a *App) showSystemMenu(ctx context.Context, chatID int64, msgID int64) {
 	if !a.spk.AreGesturesEnabled() {
 		gestureStatus = "заблокированы 🛑"
 	}
-	text := fmt.Sprintf("%s *Управление системой*\n\n• Датчик жестов ToF: *%s*\n• Питание: онлайн\n\nВыберите действие:", a.tm.Icon(ui.BtnSystem), gestureStatus)
+	text := fmt.Sprintf("⚙️ *Управление системой*\n\n• Датчик жестов ToF: *%s*\n• Питание: онлайн\n\nВыберите действие:", gestureStatus)
 	gestureBtn := telegram.NewButton("✋ Заблокировать жесты", "gesture:off")
 	if !a.spk.AreGesturesEnabled() {
 		gestureBtn = telegram.NewButton("✋ Включить жесты", "gesture:on")
@@ -915,7 +646,7 @@ func (a *App) showSystemMenu(ctx context.Context, chatID int64, msgID int64) {
 		Row(telegram.NewButton("📋 Просмотр логов (Live Logs)", "sys:logs")).
 		Row(telegram.NewButton("🧹 Очистить кэш RAM", "sys:drop_caches")).
 		Row(telegram.NewButton("🔄 Перезагрузить колонку", "sys:reboot_confirm")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 	_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
 }
@@ -927,8 +658,8 @@ func (a *App) showLogsView(ctx context.Context, chatID int64, msgID int64) {
 
 	markup := telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("🔄 Обновить логи", "sys:logs")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Назад в систему"), "nav:system")).
-		Row(telegram.NewButton(a.tm.Format(ui.BtnBack, "Главное меню"), "nav:main")).
+		Row(telegram.NewButton("⬅️ Назад в систему", "nav:system")).
+		Row(telegram.NewButton("⬅️ Главное меню", "nav:main")).
 		Build()
 
 	if msgID > 0 {

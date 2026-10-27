@@ -17,24 +17,20 @@ import (
 )
 
 type Controller struct {
-	mu           sync.Mutex
-	playCmd      *exec.Cmd
-	sirenCmd     *exec.Cmd
-	soundsDir    string
-	scriptsDir   string
-	quasarLogs   string
-	gesturesOn   bool
-	alarmRunning bool
-	stopAlarmCh  chan struct{}
+	mu         sync.Mutex
+	playCmd    *exec.Cmd
+	soundsDir  string
+	scriptsDir string
+	quasarLogs string
+	gesturesOn bool
 }
 
 func NewController(soundsDir, scriptsDir, quasarLogs string) *Controller {
 	return &Controller{
-		soundsDir:   soundsDir,
-		scriptsDir:  scriptsDir,
-		quasarLogs:  quasarLogs,
-		gesturesOn:  true,
-		stopAlarmCh: make(chan struct{}),
+		soundsDir:  soundsDir,
+		scriptsDir: scriptsDir,
+		quasarLogs: quasarLogs,
+		gesturesOn: true,
 	}
 }
 
@@ -120,21 +116,11 @@ func (c *Controller) StopPlayback() {
 }
 
 func (c *Controller) stopCurrentPlaybackLocked() {
-	if c.alarmRunning {
-		close(c.stopAlarmCh)
-		c.stopAlarmCh = make(chan struct{})
-		c.alarmRunning = false
-	}
-	if c.sirenCmd != nil && c.sirenCmd.Process != nil {
-		_ = c.sirenCmd.Process.Kill()
-		c.sirenCmd = nil
-	}
 	if c.playCmd != nil && c.playCmd.Process != nil {
 		_ = c.playCmd.Process.Kill()
 		c.playCmd = nil
 	}
 	_ = exec.Command("pkill", "-9", "-f", "maind --gst-launch").Run()
-	_ = exec.Command("killall", "-9", "aplay").Run()
 }
 
 // PlayTTS downloads Google Translate TTS mp3 and plays it directly via native GStreamer
@@ -178,77 +164,6 @@ func (c *Controller) PlayTTS(text string) error {
 	}
 
 	return c.PlayAudio(tempMP3)
-}
-
-// StartSiren plays loud siren in a continuous loop until stopped
-func (c *Controller) StartSiren() {
-	c.mu.Lock()
-	if c.alarmRunning {
-		c.mu.Unlock()
-		return
-	}
-	c.alarmRunning = true
-	stopCh := c.stopAlarmCh
-	c.mu.Unlock()
-
-	sirenPath := fmt.Sprintf("%s/alarm_loud.wav", c.soundsDir)
-	if _, err := os.Stat(sirenPath); err != nil {
-		sirenPath = fmt.Sprintf("%s/siren.wav", c.soundsDir)
-	}
-
-	go func() {
-		// Set volume to 100% for alarm
-		_ = c.SetVolume(100)
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", sirenPath)
-				cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
-				cmd.Env = append(os.Environ(),
-					"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
-					"CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt",
-				)
-
-				c.mu.Lock()
-				c.sirenCmd = cmd
-				c.mu.Unlock()
-
-				_ = cmd.Run()
-
-				c.mu.Lock()
-				if c.sirenCmd == cmd {
-					c.sirenCmd = nil
-				}
-				c.mu.Unlock()
-
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-	}()
-}
-
-func (c *Controller) StopSiren() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.alarmRunning {
-		close(c.stopAlarmCh)
-		c.stopAlarmCh = make(chan struct{})
-		c.alarmRunning = false
-	}
-	if c.sirenCmd != nil && c.sirenCmd.Process != nil {
-		_ = c.sirenCmd.Process.Kill()
-		c.sirenCmd = nil
-	}
-	_ = exec.Command("pkill", "-9", "-f", "maind --gst-launch").Run()
-	_ = exec.Command("killall", "-9", "aplay").Run()
-}
-
-func (c *Controller) IsSirenActive() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.alarmRunning
 }
 
 // -------------------------------------------------------------
