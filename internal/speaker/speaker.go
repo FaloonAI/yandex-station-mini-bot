@@ -1,7 +1,6 @@
 package speaker
 
 import (
-	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -18,10 +17,6 @@ import (
 	"time"
 
 	"github.com/gen2brain/alsa"
-	"github.com/hajimehoshi/go-mp3"
-	"github.com/kazzmir/opus-go/ogg"
-	"github.com/kazzmir/opus-go/opus"
-	"github.com/kazzmir/opus-go/wav"
 )
 
 type Controller struct {
@@ -47,24 +42,27 @@ func NewController(soundsDir, scriptsDir, quasarLogs string) *Controller {
 }
 
 // -------------------------------------------------------------
-// Audio Playback & TTS
+// Audio Playback & TTS via Native Hardware GStreamer Engine
 // -------------------------------------------------------------
 
-func (c *Controller) PlayWav(path string) error {
+// PlayAudio plays any audio file (WAV, MP3, OPUS, OGG) using Quasar's native 64-bit GStreamer pipeline.
+// Unlike legacy 32-bit aplay, GStreamer avoids rate conversion corruption, waits for EOS (preventing
+// truncated/cut-off sounds), and handles arbitrary formats directly.
+func (c *Controller) PlayAudio(filePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.stopCurrentPlaybackLocked()
 
-	cmd := exec.Command("/system/workdir/bin/aplay", "-D", "default", path)
+	pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", filePath)
+	cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
 	cmd.Env = append(os.Environ(),
-		"ALSA_CONFIG_PATH=/tmp/alsa/alsa.conf",
-		"ALSA_CONFIG_DIR=/tmp/alsa",
-		"LD_LIBRARY_PATH=/system/workdir/lib:/system/vendor/quasar/libs",
+		"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
+		"CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt",
 	)
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start aplay: %w", err)
+		return fmt.Errorf("failed to start audio player: %w", err)
 	}
 	c.playCmd = cmd
 
@@ -80,12 +78,42 @@ func (c *Controller) PlayWav(path string) error {
 	return nil
 }
 
+// PlayAudioSync plays an audio file synchronously, waiting for playback to finish before returning.
+func (c *Controller) PlayAudioSync(filePath string) error {
+	c.mu.Lock()
+	c.stopCurrentPlaybackLocked()
+
+	pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", filePath)
+	cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
+	cmd.Env = append(os.Environ(),
+		"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
+		"CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt",
+	)
+
+	c.playCmd = cmd
+	c.mu.Unlock()
+
+	err := cmd.Run()
+
+	c.mu.Lock()
+	if c.playCmd == cmd {
+		c.playCmd = nil
+	}
+	c.mu.Unlock()
+
+	return err
+}
+
+func (c *Controller) PlayWav(path string) error {
+	return c.PlayAudio(path)
+}
+
 func (c *Controller) PlaySound(soundName string) error {
 	path := fmt.Sprintf("%s/%s.wav", c.soundsDir, soundName)
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("sound %s not found: %w", soundName, err)
 	}
-	return c.PlayWav(path)
+	return c.PlayAudio(path)
 }
 
 func (c *Controller) StopPlayback() {
@@ -108,10 +136,11 @@ func (c *Controller) stopCurrentPlaybackLocked() {
 		_ = c.playCmd.Process.Kill()
 		c.playCmd = nil
 	}
+	_ = exec.Command("pkill", "-9", "-f", "maind --gst-launch").Run()
 	_ = exec.Command("killall", "-9", "aplay").Run()
 }
 
-// PlayTTS downloads Google Translate TTS mp3, decodes in memory to 16-bit WAV and plays
+// PlayTTS downloads Google Translate TTS mp3 and plays it directly via native GStreamer
 func (c *Controller) PlayTTS(text string) error {
 	encText := url.QueryEscape(text)
 	// Use translate.google.ru to avoid DPI/ISP connection resets in RU region
@@ -121,7 +150,7 @@ func (c *Controller) PlayTTS(text string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
 	// Embedded Buildroot system has outdated root CA certificates; use InsecureSkipVerify
 	client := &http.Client{
@@ -146,100 +175,12 @@ func (c *Controller) PlayTTS(text string) error {
 		return fmt.Errorf("failed to read tts mp3: %w", err)
 	}
 
-	decoder, err := mp3.NewDecoder(bytes.NewReader(mp3Data))
-	if err != nil {
-		return fmt.Errorf("failed to create mp3 decoder: %w", err)
+	tempMP3 := "/tmp/tts_voice.mp3"
+	if err := os.WriteFile(tempMP3, mp3Data, 0644); err != nil {
+		return fmt.Errorf("failed to write tts mp3: %w", err)
 	}
 
-	rawPCM, err := io.ReadAll(decoder)
-	if err != nil {
-		return fmt.Errorf("failed to decode mp3 to pcm: %w", err)
-	}
-
-	tempWav := "/tmp/tts_voice.wav"
-	if err := writeWAVFile(tempWav, rawPCM, decoder.SampleRate(), 2, 16); err != nil {
-		return fmt.Errorf("failed to write wav: %w", err)
-	}
-
-	return c.PlayWav(tempWav)
-}
-
-// DecodeOggOpusToWav decodes an Ogg Opus audio file into a 48kHz WAV file using pure Go
-func DecodeOggOpusToWav(inOggPath, outWavPath string) error {
-	in, err := os.Open(inOggPath)
-	if err != nil {
-		return fmt.Errorf("failed to open opus file: %w", err)
-	}
-	defer in.Close()
-
-	r, err := ogg.NewOpusReader(in)
-	if err != nil {
-		return fmt.Errorf("failed to create opus reader: %w", err)
-	}
-
-	dec, err := opus.NewDecoderFromHead(r.Head)
-	if err != nil {
-		return fmt.Errorf("failed to create opus decoder: %w", err)
-	}
-	defer dec.Close()
-
-	outf, err := os.Create(outWavPath)
-	if err != nil {
-		return fmt.Errorf("failed to create wav output: %w", err)
-	}
-	defer outf.Close()
-
-	channels := int(r.Head.Channels)
-	if channels <= 0 {
-		channels = 1
-	}
-
-	ww, err := wav.NewWriter(outf, 48000, channels)
-	if err != nil {
-		return fmt.Errorf("failed to create wav writer: %w", err)
-	}
-	defer ww.Close()
-
-	maxFrame := 5760
-	pcm := make([]int16, maxFrame*channels)
-	preSkipRemaining := int(r.Head.PreSkip)
-
-	for {
-		pkt, err := r.ReadAudioPacket()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read audio packet: %w", err)
-		}
-
-		n, err := dec.Decode(pkt.Data, pcm, maxFrame, false)
-		if err != nil {
-			return fmt.Errorf("decode opus packet: %w", err)
-		}
-
-		frames := pcm[:n*channels]
-		if preSkipRemaining > 0 {
-			skip := preSkipRemaining
-			if skip > n {
-				skip = n
-			}
-			preSkipRemaining -= skip
-			drop := skip * channels
-			if drop >= len(frames) {
-				continue
-			}
-			frames = frames[drop:]
-		}
-
-		if len(frames) > 0 {
-			if err := ww.WriteInt16PCM(frames); err != nil {
-				return fmt.Errorf("write pcm: %w", err)
-			}
-		}
-	}
-
-	return nil
+	return c.PlayAudio(tempMP3)
 }
 
 // StartSiren plays loud siren in a continuous loop until stopped
@@ -266,11 +207,11 @@ func (c *Controller) StartSiren() {
 			case <-stopCh:
 				return
 			default:
-				cmd := exec.Command("/system/workdir/bin/aplay", "-D", "default", sirenPath)
+				pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", sirenPath)
+				cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
 				cmd.Env = append(os.Environ(),
-					"ALSA_CONFIG_PATH=/tmp/alsa/alsa.conf",
-					"ALSA_CONFIG_DIR=/tmp/alsa",
-					"LD_LIBRARY_PATH=/system/workdir/lib:/system/vendor/quasar/libs",
+					"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
+					"CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt",
 				)
 
 				c.mu.Lock()
@@ -303,6 +244,7 @@ func (c *Controller) StopSiren() {
 		_ = c.sirenCmd.Process.Kill()
 		c.sirenCmd = nil
 	}
+	_ = exec.Command("pkill", "-9", "-f", "maind --gst-launch").Run()
 	_ = exec.Command("killall", "-9", "aplay").Run()
 }
 
@@ -423,66 +365,77 @@ func (c *Controller) RecordRoom(durationSec int) (string, error) {
 		return "", fmt.Errorf("microphone capture failed: %w", err)
 	}
 
-	// 3. Skip first 200ms (9600 frames) to discard PDM sync/startup DC transient
-	const skipFrames = uint32(9600)
 	actualFrames := uint32(readFrames)
-	if actualFrames <= skipFrames {
+	// Skip 500ms (24000 frames) to completely discard PDM hardware turn-on transient
+	const skipFrames = uint32(24000)
+	if actualFrames <= skipFrames+4800 {
 		return "", fmt.Errorf("insufficient frames recorded (%d)", actualFrames)
 	}
 
 	validFrames := actualFrames - skipFrames
-	filtered := make([]float64, validFrames)
 
-	// 4. Combine channels 0..3 (4 physical microphones) & apply 1-pole high-pass DC blocker
-	var prevX float64 = 0.0
+	// 3. Compute global DC bias mean across microphones 0..3
+	var sum float64 = 0.0
+	for i := uint32(0); i < validFrames; i++ {
+		offset := (i + skipFrames) * 8
+		c0 := float64(rawSamples[offset+0])
+		c1 := float64(rawSamples[offset+1])
+		c2 := float64(rawSamples[offset+2])
+		c3 := float64(rawSamples[offset+3])
+		sum += (c0 + c1 + c2 + c3) / 4.0
+	}
+	meanDC := sum / float64(validFrames)
+
+	// 4. Combine channels 0..3 & apply 1-pole high-pass DC blocker initialized with zero transient
+	firstOffset := skipFrames * 8
+	prevX := ((float64(rawSamples[firstOffset+0]) + float64(rawSamples[firstOffset+1]) + float64(rawSamples[firstOffset+2]) + float64(rawSamples[firstOffset+3])) / 4.0) - meanDC
 	var prevY float64 = 0.0
 	const R = 0.995 // High-pass cutoff ~38 Hz at 48kHz sample rate
 
+	filtered := make([]float64, validFrames)
 	var maxAbs float64 = 1.0
+	const settlingFrames = uint32(2000) // ignore first 40ms of filter settling for peak detection
 
 	for i := uint32(0); i < validFrames; i++ {
 		offset := (i + skipFrames) * 8
-		ch0 := float64(rawSamples[offset+0])
-		ch1 := float64(rawSamples[offset+1])
-		ch2 := float64(rawSamples[offset+2])
-		ch3 := float64(rawSamples[offset+3])
-		x := (ch0 + ch1 + ch2 + ch3) / 4.0
+		c0 := float64(rawSamples[offset+0])
+		c1 := float64(rawSamples[offset+1])
+		c2 := float64(rawSamples[offset+2])
+		c3 := float64(rawSamples[offset+3])
+		x := ((c0 + c1 + c2 + c3) / 4.0) - meanDC
 
-		// DC-blocking filter: y[n] = x[n] - x[n-1] + R * y[n-1]
+		// y[n] = x[n] - x[n-1] + R * y[n-1]
 		y := x - prevX + R*prevY
 		prevX = x
 		prevY = y
-
 		filtered[i] = y
-		absY := math.Abs(y)
-		if absY > maxAbs {
-			maxAbs = absY
+
+		if i > settlingFrames {
+			absY := math.Abs(y)
+			if absY > maxAbs {
+				maxAbs = absY
+			}
 		}
 	}
 
-	// 5. Normalize dynamic range to peak 28000 (clear, loud speech without clipping)
-	gain := 28000.0 / maxAbs
-	if gain > 50000.0 {
-		gain = 50000.0
+	// 5. Normalize with a safety noise floor (prevents blowing up silence into static)
+	if maxAbs < 1000000.0 {
+		maxAbs = 1000000.0
 	}
 
-	mono16 := make([]int16, validFrames)
-	for i, f := range filtered {
-		v := f * gain
-		if v > 32767 {
-			v = 32767
-		} else if v < -32768 {
-			v = -32768
+	scale := 26000.0 / maxAbs
+	pcm16 := make([]byte, validFrames*2)
+	for i, val := range filtered {
+		s := int32(val * scale)
+		if s > 32767 {
+			s = 32767
+		} else if s < -32768 {
+			s = -32768
 		}
-		mono16[i] = int16(v)
+		binary.LittleEndian.PutUint16(pcm16[i*2:], uint16(int16(s)))
 	}
 
-	outBuf := new(bytes.Buffer)
-	for _, s := range mono16 {
-		_ = binary.Write(outBuf, binary.LittleEndian, s)
-	}
-
-	if err := writeWAVFile(cleanFile, outBuf.Bytes(), 48000, 1, 16); err != nil {
+	if err := writeWAVFile(cleanFile, pcm16, 48000, 1, 16); err != nil {
 		return "", fmt.Errorf("failed to save wav: %w", err)
 	}
 

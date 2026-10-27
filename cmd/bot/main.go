@@ -69,6 +69,10 @@ func main() {
 func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, spk *speaker.Controller, adminID int64) {
 	// 1. Handle Callback Queries (Inline buttons)
 	if u.IsCallback() {
+		cb := u.CallbackQuery
+		if cb != nil {
+			log.Printf("[callback] Data: %s, User: %d", cb.Data, u.SenderID())
+		}
 		handleCallback(ctx, u, tg, spk, adminID)
 		return
 	}
@@ -80,6 +84,7 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 
 	// 2. Handle Voice Messages (Intercom: Play voice -> Record reply -> Send back)
 	if u.IsVoice() || u.IsAudio() {
+		log.Printf("[voice] Incoming audio from %d", msg.Chat.ID)
 		handleVoiceIntercom(ctx, u, tg, spk)
 		return
 	}
@@ -90,8 +95,11 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 		return
 	}
 
+	log.Printf("[message] Chat %d: %s", msg.Chat.ID, text)
+
 	if u.IsCommand() {
 		cmd, args := u.Command()
+		log.Printf("[command] /%s %s", cmd, args)
 		switch cmd {
 		case "start", "menu":
 			sendMainMenu(ctx, tg, msg.Chat.ID)
@@ -99,7 +107,9 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 			sendFastfetchStatus(ctx, tg, spk, msg.Chat.ID, 0)
 		case "say":
 			if args != "" {
+				log.Printf("[tts] Speaking: %s", args)
 				if err := spk.PlayTTS(args); err != nil {
+					log.Printf("[tts] Error: %v", err)
 					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
 				} else {
 					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: %s", args))
@@ -107,9 +117,11 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 			}
 		case "play":
 			if args != "" {
+				log.Printf("[sound] Playing: %s", args)
 				if err := spk.PlaySound(args); err == nil {
 					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("📢 Воспроизводится: %s", args))
 				} else {
+					log.Printf("[sound] Error: %v", err)
 					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка: %v", err))
 				}
 			}
@@ -138,7 +150,9 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 	}
 
 	// Any plain text sent to bot: treat as TTS
+	log.Printf("[tts] Plain text to speech: %s", text)
 	if err := spk.PlayTTS(text); err != nil {
+		log.Printf("[tts] Error: %v", err)
 		_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
 	} else {
 		_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: \"%s\"", text))
@@ -406,14 +420,18 @@ func editToSystemMenu(ctx context.Context, tg *telegram.Client, spk *speaker.Con
 
 func runListenCommand(ctx context.Context, tg *telegram.Client, spk *speaker.Controller, chatID int64, sec int) {
 	go func() {
+		log.Printf("[listen] Recording %d seconds...", sec)
 		_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("👂 Запись аудио из комнаты (%d сек)...", sec))
 		filePath, err := spk.RecordRoom(sec)
 		if err != nil {
+			log.Printf("[listen] RecordRoom error: %v", err)
 			_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка записи: %v", err))
 			return
 		}
+		log.Printf("[listen] Sending audio file: %s", filePath)
 		_, err = tg.SendAudioFile(ctx, chatID, filePath, fmt.Sprintf("🎙️ Аудиозапись из комнаты (%d сек)", sec), fmt.Sprintf("Запись %d сек", sec), "Яндекс Станция Mini", nil)
 		if err != nil {
+			log.Printf("[listen] SendAudioFile error: %v", err)
 			_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки аудио: %v", err))
 		}
 	}()
@@ -422,13 +440,14 @@ func runListenCommand(ctx context.Context, tg *telegram.Client, spk *speaker.Con
 func handleVoiceIntercom(ctx context.Context, u *telegram.Update, tg *telegram.Client, spk *speaker.Controller) {
 	chatID := u.ChatID()
 	go func() {
+		log.Printf("[intercom] Processing incoming voice message from chat %d", chatID)
 		_, _ = tg.SendTextMessage(ctx, chatID, "🎙️ Голосовое сообщение принято! Озвучиваю в комнате...")
 
 		// 1. Play chime alert
 		_ = spk.PlaySound("telegram")
 		time.Sleep(500 * time.Millisecond)
 
-		// 2. Download incoming voice file from Telegram and play
+		// 2. Download incoming voice file from Telegram and play via native GStreamer
 		var fileID string
 		if u.IsVoice() {
 			fileID = u.Voice().FileID
@@ -438,28 +457,31 @@ func handleVoiceIntercom(ctx context.Context, u *telegram.Update, tg *telegram.C
 
 		if fileID != "" {
 			ogaPath := "/tmp/incoming_voice.oga"
-			wavPath := "/tmp/incoming_voice.wav"
 			_ = os.Remove(ogaPath)
-			_ = os.Remove(wavPath)
 			if downloadedPath, err := tg.DownloadFile(ctx, fileID, ogaPath); err == nil {
-				if decErr := speaker.DecodeOggOpusToWav(downloadedPath, wavPath); decErr == nil {
-					_ = spk.PlayWav(wavPath)
-				} else {
-					_ = spk.PlayWav(downloadedPath)
-				}
+				log.Printf("[intercom] Playing voice note: %s", downloadedPath)
+				_ = spk.PlayAudioSync(downloadedPath)
+			} else {
+				log.Printf("[intercom] Download failed: %v", err)
 			}
 		}
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 
 		// 3. Record response from room
 		_, _ = tg.SendTextMessage(ctx, chatID, "👂 Записываю ответ из комнаты (5 сек)...")
+		log.Printf("[intercom] Recording 5s room response...")
 		recFile, err := spk.RecordRoom(5)
 		if err == nil {
+			log.Printf("[intercom] Sending recorded reply: %s", recFile)
 			_, err = tg.SendAudioFile(ctx, chatID, recFile, "🎙️ Ответ из комнаты", "Ответ из комнаты", "Яндекс Станция Mini", nil)
 			if err != nil {
+				log.Printf("[intercom] SendAudioFile error: %v", err)
 				_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка отправки ответа: %v", err))
 			}
+		} else {
+			log.Printf("[intercom] RecordRoom error: %v", err)
+			_, _ = tg.SendTextMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка записи ответа: %v", err))
 		}
 	}()
 }
