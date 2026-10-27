@@ -16,6 +16,9 @@ type Config struct {
 	AplayPath   string `json:"aplay_path"`
 	ArecordPath string `json:"arecord_path"`
 	AmixerPath  string `json:"amixer_path"`
+	Theme       string `json:"theme,omitempty"`
+	Subnet      string `json:"subnet,omitempty"`
+	DevicesFile string `json:"devices_file,omitempty"`
 }
 
 func DefaultConfig() *Config {
@@ -29,6 +32,9 @@ func DefaultConfig() *Config {
 		AplayPath:   "/system/workdir/bin/aplay",
 		ArecordPath: "/system/workdir/bin/arecord",
 		AmixerPath:  "/system/workdir/bin/amixer",
+		Theme:       "Default",
+		Subnet:      "192.168.20.0/24",
+		DevicesFile: "/data/telegram-bot/known_devices.json",
 	}
 }
 

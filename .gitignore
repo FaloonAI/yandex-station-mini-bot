@@ -12,6 +12,7 @@ yandex-mini-bot
 .env
 .env.*
 config.json
+known_devices.json
 *.key
 *.pem
 id_ed25519*
