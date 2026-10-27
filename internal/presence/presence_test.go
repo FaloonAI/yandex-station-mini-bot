@@ -138,3 +138,35 @@ func TestSubnetGeneration(t *testing.T) {
 		t.Errorf("unexpected IPs: %v", ips)
 	}
 }
+
+func TestSubnetGetSetAndDetect(t *testing.T) {
+	s := NewScanner(WithSubnet("192.168.20.0/24"))
+	if s.GetSubnet() != "192.168.20.0/24" {
+		t.Errorf("expected 192.168.20.0/24, got %s", s.GetSubnet())
+	}
+
+	if err := s.SetSubnet("10.0.0.0/24"); err != nil {
+		t.Fatalf("SetSubnet failed: %v", err)
+	}
+	if s.GetSubnet() != "10.0.0.0/24" {
+		t.Errorf("expected 10.0.0.0/24, got %s", s.GetSubnet())
+	}
+
+	// Normalizes host IP to network CIDR
+	if err := s.SetSubnet("192.168.1.155/24"); err != nil {
+		t.Fatalf("SetSubnet with host IP failed: %v", err)
+	}
+	if s.GetSubnet() != "192.168.1.0/24" {
+		t.Errorf("expected normalized 192.168.1.0/24, got %s", s.GetSubnet())
+	}
+
+	if err := s.SetSubnet("invalid-cidr"); err == nil {
+		t.Error("expected error for invalid CIDR, got nil")
+	}
+
+	// Test DetectLocalSubnet doesn't panic
+	subnet, err := DetectLocalSubnet("")
+	if err == nil && subnet == "" {
+		t.Error("expected non-empty subnet if err is nil")
+	}
+}

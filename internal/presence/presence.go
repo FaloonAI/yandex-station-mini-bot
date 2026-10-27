@@ -135,6 +135,64 @@ func (s *Scanner) GetAllKnownDevices() map[string]string {
 	return result
 }
 
+// SetSubnet validates and updates the target scan subnet at runtime.
+func (s *Scanner) SetSubnet(cidr string) error {
+	_, ipNet, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return fmt.Errorf("invalid CIDR subnet %q: %w", cidr, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.subnet = ipNet.String()
+	return nil
+}
+
+// GetSubnet returns the currently configured scan subnet.
+func (s *Scanner) GetSubnet() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.subnet
+}
+
+// DetectLocalSubnet detects the IPv4 CIDR subnet of a local interface (e.g. "wlan0").
+// If ifaceName is empty, it finds the first non-loopback active IPv4 interface.
+func DetectLocalSubnet(ifaceName string) (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to list network interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		if ifaceName != "" && iface.Name != ifaceName {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if ok && ipNet.IP.To4() != nil {
+				network := ipNet.IP.Mask(ipNet.Mask)
+				ones, _ := ipNet.Mask.Size()
+				return fmt.Sprintf("%s/%d", network.String(), ones), nil
+			}
+		}
+	}
+
+	// Fallback to searching any active IPv4 interface if specific interface not found
+	if ifaceName != "" {
+		return DetectLocalSubnet("")
+	}
+
+	return "", fmt.Errorf("no active IPv4 address found")
+}
+
 // SaveKnownDevices serializes known devices to a JSON file.
 func (s *Scanner) SaveKnownDevices(path string) error {
 	s.mu.RLock()

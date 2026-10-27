@@ -60,3 +60,12 @@ func LoadConfig(path string) (*Config, error) {
 
 	return cfg, nil
 }
+
+// Save marshals and writes the config back to disk with proper formatting and permissions.
+func (c *Config) Save(path string) error {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0600)
+}

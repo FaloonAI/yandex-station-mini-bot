@@ -81,6 +81,15 @@ type Audio struct {
 	FileSize     int64  `json:"file_size,omitempty"`
 }
 
+// Document represents a general file sent in Telegram.
+type Document struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	FileName     string `json:"file_name,omitempty"`
+	MimeType     string `json:"mime_type,omitempty"`
+	FileSize     int64  `json:"file_size,omitempty"`
+}
+
 // InlineKeyboardButton represents one button of an inline keyboard.
 type InlineKeyboardButton struct {
 	Text         string `json:"text"`
@@ -103,6 +112,7 @@ type Message struct {
 	Caption     string                `json:"caption,omitempty"`
 	Voice       *Voice                `json:"voice,omitempty"`
 	Audio       *Audio                `json:"audio,omitempty"`
+	Document    *Document             `json:"document,omitempty"`
 	ReplyMarkup *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
 }
 
@@ -113,7 +123,32 @@ func (m *Message) IsVoice() bool {
 
 // IsAudio returns true if the message contains an audio file.
 func (m *Message) IsAudio() bool {
-	return m != nil && m.Audio != nil
+	return m != nil && (m.Audio != nil || (m.Document != nil && (strings.HasPrefix(m.Document.MimeType, "audio/") || strings.HasSuffix(strings.ToLower(m.Document.FileName), ".wav") || strings.HasSuffix(strings.ToLower(m.Document.FileName), ".mp3") || strings.HasSuffix(strings.ToLower(m.Document.FileName), ".ogg"))))
+}
+
+// AudioFileID returns the Telegram file ID and suggested file name.
+func (m *Message) AudioFileID() (string, string) {
+	if m == nil {
+		return "", ""
+	}
+	if m.Voice != nil {
+		return m.Voice.FileID, "voice.oga"
+	}
+	if m.Audio != nil {
+		name := m.Audio.FileName
+		if name == "" {
+			name = "audio.mp3"
+		}
+		return m.Audio.FileID, name
+	}
+	if m.Document != nil {
+		name := m.Document.FileName
+		if name == "" {
+			name = "document.audio"
+		}
+		return m.Document.FileID, name
+	}
+	return "", ""
 }
 
 // IsCommand checks if the message starts with a bot slash command.
