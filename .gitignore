@@ -1,0 +1,30 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+yandex-mini-bot
+*.test
+
+# Secrets and environment
+.env
+.env.*
+config.json
+*.key
+*.pem
+id_ed25519*
+
+# Temporary files and audio recordings
+temp_*.wav
+rec_*.wav
+*.tmp
+*.log
+
+# OS / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

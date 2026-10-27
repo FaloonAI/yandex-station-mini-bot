@@ -1,0 +1,8 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN_HERE",
+  "admin_id": 123456789,
+  "sounds_dir": "/data/telegram-bot/sounds",
+  "scripts_dir": "/data/telegram-bot/scripts",
+  "log_path": "/data/telegram-bot/bot.log",
+  "quasar_logs": "/data/quasar/daemons_logs/maind.log"
+}
