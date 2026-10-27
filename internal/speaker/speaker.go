@@ -27,6 +27,7 @@ import (
 type Controller struct {
 	mu           sync.Mutex
 	playCmd      *exec.Cmd
+	sirenCmd     *exec.Cmd
 	soundsDir    string
 	scriptsDir   string
 	quasarLogs   string
@@ -99,6 +100,10 @@ func (c *Controller) stopCurrentPlaybackLocked() {
 		c.stopAlarmCh = make(chan struct{})
 		c.alarmRunning = false
 	}
+	if c.sirenCmd != nil && c.sirenCmd.Process != nil {
+		_ = c.sirenCmd.Process.Kill()
+		c.sirenCmd = nil
+	}
 	if c.playCmd != nil && c.playCmd.Process != nil {
 		_ = c.playCmd.Process.Kill()
 		c.playCmd = nil
@@ -109,13 +114,14 @@ func (c *Controller) stopCurrentPlaybackLocked() {
 // PlayTTS downloads Google Translate TTS mp3, decodes in memory to 16-bit WAV and plays
 func (c *Controller) PlayTTS(text string) error {
 	encText := url.QueryEscape(text)
-	ttsURL := fmt.Sprintf("https://translate.google.com/translate_tts?ie=UTF-8&q=%s&tl=ru&client=tw-ob", encText)
+	// Use translate.google.ru to avoid DPI/ISP connection resets in RU region
+	ttsURL := fmt.Sprintf("https://translate.google.ru/translate_tts?ie=UTF-8&q=%s&tl=ru&client=tw-ob", encText)
 
 	req, err := http.NewRequest(http.MethodGet, ttsURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 
 	// Embedded Buildroot system has outdated root CA certificates; use InsecureSkipVerify
 	client := &http.Client{
@@ -132,7 +138,7 @@ func (c *Controller) PlayTTS(text string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("tts server returned %d", resp.StatusCode)
+		return fmt.Errorf("tts server returned HTTP %d", resp.StatusCode)
 	}
 
 	mp3Data, err := io.ReadAll(resp.Body)
@@ -236,7 +242,7 @@ func DecodeOggOpusToWav(inOggPath, outWavPath string) error {
 	return nil
 }
 
-// StartSiren plays siren in a continuous loop until stopped
+// StartSiren plays loud siren in a continuous loop until stopped
 func (c *Controller) StartSiren() {
 	c.mu.Lock()
 	if c.alarmRunning {
@@ -247,7 +253,10 @@ func (c *Controller) StartSiren() {
 	stopCh := c.stopAlarmCh
 	c.mu.Unlock()
 
-	sirenPath := fmt.Sprintf("%s/siren.wav", c.soundsDir)
+	sirenPath := fmt.Sprintf("%s/alarm_loud.wav", c.soundsDir)
+	if _, err := os.Stat(sirenPath); err != nil {
+		sirenPath = fmt.Sprintf("%s/siren.wav", c.soundsDir)
+	}
 
 	go func() {
 		// Set volume to 100% for alarm
@@ -263,7 +272,19 @@ func (c *Controller) StartSiren() {
 					"ALSA_CONFIG_DIR=/tmp/alsa",
 					"LD_LIBRARY_PATH=/system/workdir/lib:/system/vendor/quasar/libs",
 				)
+
+				c.mu.Lock()
+				c.sirenCmd = cmd
+				c.mu.Unlock()
+
 				_ = cmd.Run()
+
+				c.mu.Lock()
+				if c.sirenCmd == cmd {
+					c.sirenCmd = nil
+				}
+				c.mu.Unlock()
+
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
@@ -271,7 +292,18 @@ func (c *Controller) StartSiren() {
 }
 
 func (c *Controller) StopSiren() {
-	c.StopPlayback()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.alarmRunning {
+		close(c.stopAlarmCh)
+		c.stopAlarmCh = make(chan struct{})
+		c.alarmRunning = false
+	}
+	if c.sirenCmd != nil && c.sirenCmd.Process != nil {
+		_ = c.sirenCmd.Process.Kill()
+		c.sirenCmd = nil
+	}
+	_ = exec.Command("killall", "-9", "aplay").Run()
 }
 
 func (c *Controller) IsSirenActive() bool {
@@ -391,44 +423,62 @@ func (c *Controller) RecordRoom(durationSec int) (string, error) {
 		return "", fmt.Errorf("microphone capture failed: %w", err)
 	}
 
-	// 3. Downmix captured 8-channel S32 samples to 1-channel 16-bit WAV with volume normalization
+	// 3. Skip first 200ms (9600 frames) to discard PDM sync/startup DC transient
+	const skipFrames = uint32(9600)
 	actualFrames := uint32(readFrames)
-	if actualFrames > totalFrames {
-		actualFrames = totalFrames
+	if actualFrames <= skipFrames {
+		return "", fmt.Errorf("insufficient frames recorded (%d)", actualFrames)
 	}
 
-	monoSamps := make([]int16, actualFrames)
+	validFrames := actualFrames - skipFrames
+	filtered := make([]float64, validFrames)
+
+	// 4. Combine channels 0..3 (4 physical microphones) & apply 1-pole high-pass DC blocker
+	var prevX float64 = 0.0
+	var prevY float64 = 0.0
+	const R = 0.995 // High-pass cutoff ~38 Hz at 48kHz sample rate
+
 	var maxAbs float64 = 1.0
 
-	for i := uint32(0); i < actualFrames; i++ {
-		offset := i * 8
+	for i := uint32(0); i < validFrames; i++ {
+		offset := (i + skipFrames) * 8
 		ch0 := float64(rawSamples[offset+0])
 		ch1 := float64(rawSamples[offset+1])
-		avg := (ch0 + ch1) / 2.0
-		// Convert from 32-bit signed to 16-bit range
-		val16 := avg / 65536.0
-		if math.Abs(val16) > maxAbs {
-			maxAbs = math.Abs(val16)
+		ch2 := float64(rawSamples[offset+2])
+		ch3 := float64(rawSamples[offset+3])
+		x := (ch0 + ch1 + ch2 + ch3) / 4.0
+
+		// DC-blocking filter: y[n] = x[n] - x[n-1] + R * y[n-1]
+		y := x - prevX + R*prevY
+		prevX = x
+		prevY = y
+
+		filtered[i] = y
+		absY := math.Abs(y)
+		if absY > maxAbs {
+			maxAbs = absY
 		}
-		monoSamps[i] = int16(val16)
 	}
 
-	// Normalize peak gain for loud, clear room audio
-	if maxAbs > 10.0 {
-		gain := 31000.0 / maxAbs
-		for i := range monoSamps {
-			norm := float64(monoSamps[i]) * gain
-			if norm > 32767 {
-				norm = 32767
-			} else if norm < -32768 {
-				norm = -32768
-			}
-			monoSamps[i] = int16(norm)
+	// 5. Normalize dynamic range to peak 28000 (clear, loud speech without clipping)
+	gain := 28000.0 / maxAbs
+	if gain > 50000.0 {
+		gain = 50000.0
+	}
+
+	mono16 := make([]int16, validFrames)
+	for i, f := range filtered {
+		v := f * gain
+		if v > 32767 {
+			v = 32767
+		} else if v < -32768 {
+			v = -32768
 		}
+		mono16[i] = int16(v)
 	}
 
 	outBuf := new(bytes.Buffer)
-	for _, s := range monoSamps {
+	for _, s := range mono16 {
 		_ = binary.Write(outBuf, binary.LittleEndian, s)
 	}
 

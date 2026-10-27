@@ -99,8 +99,11 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 			sendFastfetchStatus(ctx, tg, spk, msg.Chat.ID, 0)
 		case "say":
 			if args != "" {
-				_ = spk.PlayTTS(args)
-				_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: %s", args))
+				if err := spk.PlayTTS(args); err != nil {
+					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
+				} else {
+					_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: %s", args))
+				}
 			}
 		case "play":
 			if args != "" {
@@ -135,8 +138,11 @@ func handleUpdate(ctx context.Context, u *telegram.Update, tg *telegram.Client, 
 	}
 
 	// Any plain text sent to bot: treat as TTS
-	_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучиваю: \"%s\"", text))
-	_ = spk.PlayTTS(text)
+	if err := spk.PlayTTS(text); err != nil {
+		_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("❌ Ошибка озвучки: %v", err))
+	} else {
+		_, _ = tg.SendTextMessage(ctx, msg.Chat.ID, fmt.Sprintf("🗣 Озвучено: \"%s\"", text))
+	}
 }
 
 func handleCallback(ctx context.Context, u *telegram.Update, tg *telegram.Client, spk *speaker.Controller, adminID int64) {
@@ -171,7 +177,7 @@ func handleCallback(ctx context.Context, u *telegram.Update, tg *telegram.Client
 	case data == "nav:soundboard":
 		text := "📢 *Саундборд*\n\nВыберите звук для мгновенного воспроизведения на колонке:"
 		markup := telegram.NewKeyboardBuilder().
-			Row(telegram.NewButton("📢 Airhorn", "snd:airhorn"), telegram.NewButton("🚨 Alarm", "snd:alarm")).
+			Row(telegram.NewButton("📢 Airhorn", "snd:airhorn"), telegram.NewButton("🚨 Alarm", "snd:alarm_loud")).
 			Row(telegram.NewButton("🎺 Bruh", "snd:bruh"), telegram.NewButton("🔔 Discord", "snd:discord")).
 			Row(telegram.NewButton("💨 Fart", "snd:fart"), telegram.NewButton("🪈 Metal Pipe", "snd:metal_pipe")).
 			Row(telegram.NewButton("🎵 Rickroll", "snd:rickroll"), telegram.NewButton("🔊 Win XP", "snd:winxp")).
@@ -244,8 +250,11 @@ func handleCallback(ctx context.Context, u *telegram.Update, tg *telegram.Client
 			spk.StopPlayback()
 			_ = tg.AnswerCallbackAlert(ctx, cb.ID, "Звук остановлен")
 		} else {
-			_ = tg.AnswerCallback(ctx, cb.ID)
-			_ = spk.PlaySound(sound)
+			if err := spk.PlaySound(sound); err != nil {
+				_ = tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("❌ Ошибка: %v", err))
+			} else {
+				_ = tg.AnswerCallback(ctx, cb.ID)
+			}
 		}
 
 	case strings.HasPrefix(data, "rec:"):
