@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,8 +99,13 @@ func NewClient(token string, adminID int64, opts ...ClientOption) (*Client, erro
 	c := &Client{
 		token:       strings.TrimSpace(token),
 		adminID:     adminID,
-		apiBaseURL:  defaultBaseURL,
-		httpClient:  &http.Client{Timeout: 0}, // Rely on request-specific context timeouts
+		apiBaseURL: defaultBaseURL,
+		httpClient: &http.Client{
+			Timeout: 0,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		},
 		pollTimeout: defaultPollTimeout,
 	}
 

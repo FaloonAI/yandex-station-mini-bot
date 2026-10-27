@@ -21,7 +21,7 @@ case "${1:-start}" in
     if [ -f "$LOGFILE" ] && [ $(wc -c < "$LOGFILE") -gt 500000 ]; then
       mv -f "$LOGFILE" "$LOGFILE.old"
     fi
-    LD_LIBRARY_PATH=/system/vendor/quasar/libs nohup "$BIN" -c "$CONFIG" >>"$LOGFILE" 2>&1 &
+    LD_LIBRARY_PATH=/system/vendor/quasar/libs setsid "$BIN" -c "$CONFIG" </dev/null >>"$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
     if kill -0 $(cat "$PIDFILE") 2>/dev/null; then
