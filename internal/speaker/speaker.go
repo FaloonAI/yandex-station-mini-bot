@@ -16,6 +16,28 @@ import (
 	"time"
 )
 
+type EQBands struct {
+	Band0 float64 // Bass (100 Hz, gain in dB: -24.0 to +12.0)
+	Band1 float64 // Mid (1100 Hz, gain in dB: -24.0 to +12.0)
+	Band2 float64 // Treble (11000 Hz, gain in dB: -24.0 to +12.0)
+}
+
+// EqualizerPresets holds pre-tuned EQ profiles for the Yandex Station Mini.
+var EqualizerPresets = map[string]EQBands{
+	"balanced":   {Band0: 0.0, Band1: 0.0, Band2: 0.0},
+	"bass_boost": {Band0: 7.0, Band1: -1.0, Band2: 1.0},
+	"vocal":      {Band0: -4.0, Band1: 6.0, Band2: 2.0},
+	"treble":     {Band0: 2.0, Band1: -1.0, Band2: 6.0},
+}
+
+// EqualizerPresetNames maps preset IDs to user-friendly display labels.
+var EqualizerPresetNames = map[string]string{
+	"balanced":   "⚖️ Сбалансированный",
+	"bass_boost": "🔊 Усиление басов (Bass Boost)",
+	"vocal":      "🗣️ Голос и подкасты (Vocal)",
+	"treble":     "🎵 Яркий / Музыка (Treble)",
+}
+
 type Controller struct {
 	mu         sync.Mutex
 	playCmd    *exec.Cmd
@@ -23,6 +45,7 @@ type Controller struct {
 	scriptsDir string
 	quasarLogs string
 	gesturesOn bool
+	currentEQ  string
 }
 
 func NewController(soundsDir, scriptsDir, quasarLogs string) *Controller {
@@ -31,23 +54,54 @@ func NewController(soundsDir, scriptsDir, quasarLogs string) *Controller {
 		scriptsDir: scriptsDir,
 		quasarLogs: quasarLogs,
 		gesturesOn: true,
+		currentEQ:  "balanced",
 	}
+}
+
+// SetEqualizerPreset updates the active equalizer profile.
+func (c *Controller) SetEqualizerPreset(presetID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	clean := strings.ToLower(strings.TrimSpace(presetID))
+	if _, ok := EqualizerPresets[clean]; !ok {
+		return fmt.Errorf("unknown equalizer preset %q (available: balanced, bass_boost, vocal, treble)", presetID)
+	}
+	c.currentEQ = clean
+	return nil
+}
+
+// GetEqualizerPreset returns the currently active EQ preset ID.
+func (c *Controller) GetEqualizerPreset() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.currentEQ == "" {
+		return "balanced"
+	}
+	return c.currentEQ
+}
+
+func (c *Controller) buildPlaybackPipelineLocked(filePath string) string {
+	bands, ok := EqualizerPresets[c.currentEQ]
+	if !ok {
+		bands = EqualizerPresets["balanced"]
+	}
+	return fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! equalizer-3bands band0=%.1f band1=%.1f band2=%.1f ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default",
+		filePath, bands.Band0, bands.Band1, bands.Band2)
 }
 
 // -------------------------------------------------------------
 // Audio Playback & TTS via Native Hardware GStreamer Engine
 // -------------------------------------------------------------
 
-// PlayAudio plays any audio file (WAV, MP3, OPUS, OGG) using Quasar's native 64-bit GStreamer pipeline.
-// Unlike legacy 32-bit aplay, GStreamer avoids rate conversion corruption, waits for EOS (preventing
-// truncated/cut-off sounds), and handles arbitrary formats directly.
+// PlayAudio plays any audio file (WAV, MP3, OPUS, OGG) using Quasar's native 64-bit GStreamer pipeline with active EQ.
 func (c *Controller) PlayAudio(filePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.stopCurrentPlaybackLocked()
 
-	pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", filePath)
+	pipeline := c.buildPlaybackPipelineLocked(filePath)
 	cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
 	cmd.Env = append(os.Environ(),
 		"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
@@ -76,7 +130,7 @@ func (c *Controller) PlayAudioSync(filePath string) error {
 	c.mu.Lock()
 	c.stopCurrentPlaybackLocked()
 
-	pipeline := fmt.Sprintf("filesrc location=%s ! decodebin ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2,format=S16LE ! alsasink device=default", filePath)
+	pipeline := c.buildPlaybackPipelineLocked(filePath)
 	cmd := exec.Command("/system/vendor/quasar/maind", "--gst-launch", pipeline)
 	cmd.Env = append(os.Environ(),
 		"LD_LIBRARY_PATH=/system/vendor/quasar/libs",
@@ -354,6 +408,41 @@ func (c *Controller) Reboot() error {
 		_ = exec.Command("reboot").Run()
 	}()
 	return nil
+}
+
+// -------------------------------------------------------------
+// Bluetooth (A2DP Sink / bsa_server) Stack Control
+// -------------------------------------------------------------
+
+// IsBluetoothEnabled checks if the Broadcom Bluetooth stack (bsa_server) is currently running.
+func (c *Controller) IsBluetoothEnabled() bool {
+	out, err := exec.Command("pidof", "bsa_server").Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+// GetBluetoothPID returns the process ID of bsa_server or empty string.
+func (c *Controller) GetBluetoothPID() string {
+	out, err := exec.Command("pidof", "bsa_server").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// SetBluetoothEnabled starts (1) or stops (0) the Broadcom Bluetooth BSA server.
+func (c *Controller) SetBluetoothEnabled(enable bool) error {
+	arg := "0"
+	if enable {
+		arg = "1"
+	}
+	return exec.Command("/system/vendor/quasar/bsa_server_run.sh", arg).Run()
+}
+
+// RestartBluetooth cleanly cycles the Bluetooth stack.
+func (c *Controller) RestartBluetooth() error {
+	_ = c.SetBluetoothEnabled(false)
+	time.Sleep(1 * time.Second)
+	return c.SetBluetoothEnabled(true)
 }
 
 // -------------------------------------------------------------

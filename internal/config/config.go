@@ -16,25 +16,37 @@ type Config struct {
 	AplayPath   string `json:"aplay_path"`
 	ArecordPath string `json:"arecord_path"`
 	AmixerPath  string `json:"amixer_path"`
-	Subnet        string `json:"subnet,omitempty"`
-	DevicesFile   string `json:"devices_file,omitempty"`
-	AutoDeleteSec int    `json:"auto_delete_sec,omitempty"`
+	Subnet               string `json:"subnet,omitempty"`
+	DevicesFile          string `json:"devices_file,omitempty"`
+	AutoDeleteSec        int    `json:"auto_delete_sec,omitempty"`
+	NightModeEnabled     bool   `json:"night_mode_enabled,omitempty"`
+	NightStartHour       int    `json:"night_start_hour,omitempty"`
+	NightEndHour         int    `json:"night_end_hour,omitempty"`
+	NightMaxVol          int    `json:"night_max_vol,omitempty"`
+	NightBlockSoundboard bool   `json:"night_block_soundboard,omitempty"`
+	EQPreset             string `json:"eq_preset,omitempty"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		BotToken:      "",
-		AdminID:       0,
-		SoundsDir:     "/data/telegram-bot/sounds",
-		ScriptsDir:    "/data/telegram-bot/scripts",
-		LogPath:       "/data/telegram-bot/bot.log",
-		QuasarLogs:    "/data/quasar/daemons_logs/maind.log",
-		AplayPath:     "/system/workdir/bin/aplay",
-		ArecordPath:   "/system/workdir/bin/arecord",
-		AmixerPath:    "/system/workdir/bin/amixer",
-		Subnet:        "192.168.20.0/24",
-		DevicesFile:   "/data/telegram-bot/known_devices.json",
-		AutoDeleteSec: 5,
+		BotToken:             "",
+		AdminID:              0,
+		SoundsDir:            "/data/telegram-bot/sounds",
+		ScriptsDir:           "/data/telegram-bot/scripts",
+		LogPath:              "/data/telegram-bot/bot.log",
+		QuasarLogs:           "/data/quasar/daemons_logs/maind.log",
+		AplayPath:            "/system/workdir/bin/aplay",
+		ArecordPath:          "/system/workdir/bin/arecord",
+		AmixerPath:           "/system/workdir/bin/amixer",
+		Subnet:               "192.168.20.0/24",
+		DevicesFile:          "/data/telegram-bot/known_devices.json",
+		AutoDeleteSec:        5,
+		NightModeEnabled:     true,
+		NightStartHour:       23,
+		NightEndHour:         8,
+		NightMaxVol:          25,
+		NightBlockSoundboard: true,
+		EQPreset:             "balanced",
 	}
 }
 

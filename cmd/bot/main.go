@@ -17,6 +17,7 @@ import (
 
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/config"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/netdiag"
+	"github.com/FaloonAI/yandex-station-mini-bot/internal/nightmode"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/presence"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/soundboard"
 	"github.com/FaloonAI/yandex-station-mini-bot/internal/speaker"
@@ -31,6 +32,7 @@ type App struct {
 	scanner          *presence.Scanner
 	diag             *netdiag.Diagnostics
 	sb               *soundboard.Manager
+	night            *nightmode.Manager
 	awaitingAddSound sync.Map // chatID int64 -> bool
 }
 
@@ -46,6 +48,10 @@ func main() {
 	}
 
 	spk := speaker.NewController(cfg.SoundsDir, cfg.ScriptsDir, cfg.QuasarLogs)
+	if cfg.EQPreset != "" {
+		_ = spk.SetEqualizerPreset(cfg.EQPreset)
+	}
+
 	tg, err := telegram.NewClient(cfg.BotToken, cfg.AdminID)
 	if err != nil {
 		log.Fatalf("Failed to create telegram client: %v", err)
@@ -62,6 +68,14 @@ func main() {
 		log.Fatalf("Soundboard manager error: %v", err)
 	}
 
+	nightMgr := nightmode.NewManager(nightmode.Config{
+		Enabled:         cfg.NightModeEnabled,
+		StartHour:       cfg.NightStartHour,
+		EndHour:         cfg.NightEndHour,
+		MaxVolume:       cfg.NightMaxVol,
+		BlockSoundboard: cfg.NightBlockSoundboard,
+	})
+
 	app := &App{
 		configPath: *configPath,
 		cfg:        cfg,
@@ -70,6 +84,7 @@ func main() {
 		scanner:    scanner,
 		diag:       diag,
 		sb:         sbManager,
+		night:      nightMgr,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,6 +134,15 @@ func (a *App) sendEphemeral(ctx context.Context, chatID int64, text string, trig
 		a.tg.DeleteAfter(delay, chatID, triggerMsgID, rep.MessageID)
 	} else if triggerMsgID > 0 {
 		a.tg.DeleteAfter(delay, chatID, triggerMsgID)
+	}
+}
+
+func (a *App) enforceNightVolume() {
+	curVol, _, err := a.spk.GetVolume()
+	if err == nil {
+		if maxVol, capped := a.night.EnforceVolume(curVol); capped {
+			_ = a.spk.SetVolume(maxVol)
+		}
 	}
 }
 
@@ -194,8 +218,28 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 			a.handleDelSoundCommand(ctx, msg.Chat.ID, args, msg.MessageID)
 		case "rensound":
 			a.handleRenSoundCommand(ctx, msg.Chat.ID, args, msg.MessageID)
+		case "night":
+			a.showNightModeMenu(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
+		case "bt", "bluetooth":
+			a.showBluetoothMenu(ctx, msg.Chat.ID, 0)
+			a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
+		case "eq":
+			if args != "" {
+				if err := a.spk.SetEqualizerPreset(args); err != nil {
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("❌ %v", err), msg.MessageID)
+				} else {
+					a.cfg.EQPreset = a.spk.GetEqualizerPreset()
+					_ = a.cfg.Save(a.configPath)
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("🎛️ Эквалайзер переключен: *%s*", speaker.EqualizerPresetNames[a.cfg.EQPreset]), msg.MessageID)
+				}
+			} else {
+				a.showEqualizerMenu(ctx, msg.Chat.ID, 0)
+				a.tg.DeleteAfter(3*time.Second, msg.Chat.ID, msg.MessageID)
+			}
 		case "say":
 			if args != "" {
+				a.enforceNightVolume()
 				log.Printf("[tts] Speaking: %s", args)
 				if err := a.spk.PlayTTS(args); err != nil {
 					log.Printf("[tts] Error: %v", err)
@@ -208,6 +252,12 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 			}
 		case "play":
 			if args != "" {
+				if a.night.ShouldBlockSoundboard() {
+					cfg := a.night.GetConfig()
+					a.sendEphemeral(ctx, msg.Chat.ID, fmt.Sprintf("🌙 Ночной режим активен (%02d:00 - %02d:00). Звуки саундборда временно заблокированы.", cfg.StartHour, cfg.EndHour), msg.MessageID)
+					return
+				}
+				a.enforceNightVolume()
 				log.Printf("[sound] Playing: %s", args)
 				filePath, err := a.sb.SoundFilePath(args)
 				if err != nil {
@@ -246,6 +296,7 @@ func (a *App) handleUpdate(ctx context.Context, u *telegram.Update) {
 	}
 
 	// Any plain text sent to bot: treat as TTS
+	a.enforceNightVolume()
 	log.Printf("[tts] Plain text to speech: %s", text)
 	if err := a.spk.PlayTTS(text); err != nil {
 		log.Printf("[tts] Error: %v", err)
@@ -341,6 +392,87 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 	case data == "nav:volume":
 		a.showVolumeMenu(ctx, chatID, msgID)
 
+	case data == "nav:night":
+		a.showNightModeMenu(ctx, chatID, msgID)
+
+	case data == "night:toggle":
+		cfg := a.night.GetConfig()
+		a.night.SetEnabled(!cfg.Enabled)
+		a.cfg.NightModeEnabled = !cfg.Enabled
+		if a.configPath != "" {
+			_ = a.cfg.Save(a.configPath)
+		}
+		a.showNightModeMenu(ctx, chatID, msgID)
+
+	case strings.HasPrefix(data, "night:hours:"):
+		parts := strings.Split(strings.TrimPrefix(data, "night:hours:"), ":")
+		if len(parts) == 2 {
+			s, _ := strconv.Atoi(parts[0])
+			e, _ := strconv.Atoi(parts[1])
+			_ = a.night.SetHours(s, e)
+			a.cfg.NightStartHour = s
+			a.cfg.NightEndHour = e
+			if a.configPath != "" {
+				_ = a.cfg.Save(a.configPath)
+			}
+			a.showNightModeMenu(ctx, chatID, msgID)
+		}
+
+	case strings.HasPrefix(data, "night:vol:"):
+		v, _ := strconv.Atoi(strings.TrimPrefix(data, "night:vol:"))
+		_ = a.night.SetMaxVolume(v)
+		a.cfg.NightMaxVol = v
+		if a.configPath != "" {
+			_ = a.cfg.Save(a.configPath)
+		}
+		a.showNightModeMenu(ctx, chatID, msgID)
+
+	case data == "night:block:toggle":
+		cfg := a.night.GetConfig()
+		a.night.SetBlockSoundboard(!cfg.BlockSoundboard)
+		a.cfg.NightBlockSoundboard = !cfg.BlockSoundboard
+		if a.configPath != "" {
+			_ = a.cfg.Save(a.configPath)
+		}
+		a.showNightModeMenu(ctx, chatID, msgID)
+
+	case data == "nav:eq":
+		a.showEqualizerMenu(ctx, chatID, msgID)
+
+	case strings.HasPrefix(data, "eq:"):
+		preset := strings.TrimPrefix(data, "eq:")
+		if err := a.spk.SetEqualizerPreset(preset); err != nil {
+			_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("Ошибка: %v", err))
+		} else {
+			a.cfg.EQPreset = a.spk.GetEqualizerPreset()
+			if a.configPath != "" {
+				_ = a.cfg.Save(a.configPath)
+			}
+			_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("Эквалайзер: %s", speaker.EqualizerPresetNames[a.cfg.EQPreset]))
+			a.showEqualizerMenu(ctx, chatID, msgID)
+		}
+
+	case data == "sys:bt_menu":
+		a.showBluetoothMenu(ctx, chatID, msgID)
+
+	case data == "bt:on":
+		_ = a.spk.SetBluetoothEnabled(true)
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Bluetooth включен!")
+		time.Sleep(500 * time.Millisecond)
+		a.showBluetoothMenu(ctx, chatID, msgID)
+
+	case data == "bt:off":
+		_ = a.spk.SetBluetoothEnabled(false)
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Bluetooth выключен!")
+		time.Sleep(500 * time.Millisecond)
+		a.showBluetoothMenu(ctx, chatID, msgID)
+
+	case data == "bt:restart":
+		_ = a.spk.RestartBluetooth()
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Стек Bluetooth перезапущен!")
+		time.Sleep(500 * time.Millisecond)
+		a.showBluetoothMenu(ctx, chatID, msgID)
+
 	case data == "nav:tts":
 		text := "🔊 *Синтез речи (TTS)*\n\n" +
 			"Просто напишите любой текст в чат или используйте команду:\n`/say Привет, мир!`\n\nКолонка мгновенно произнесет его приятным голосом."
@@ -401,6 +533,12 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 			a.spk.StopPlayback()
 			_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Звук остановлен")
 		} else {
+			if a.night.ShouldBlockSoundboard() {
+				cfg := a.night.GetConfig()
+				_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("🌙 Ночной режим активен (%02d:00 - %02d:00). Звуки саундборда временно заблокированы.", cfg.StartHour, cfg.EndHour))
+				return
+			}
+			a.enforceNightVolume()
 			filePath, err := a.sb.SoundFilePath(sound)
 			if err != nil {
 				_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, fmt.Sprintf("❌ Звук не найден: %v", err))
@@ -472,7 +610,7 @@ func (a *App) getMainMenuMarkup() *telegram.InlineKeyboardMarkup {
 	return telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("📊 Статус & Fastfetch", "nav:status")).
 		Row(telegram.NewButton("🎙️ Рация & Прослушка", "nav:intercom"), telegram.NewButton("📢 Саундборд", "nav:soundboard")).
-		Row(telegram.NewButton("🔊 Озвучить текст", "nav:tts"), telegram.NewButton("🎚️ Громкость", "nav:volume")).
+		Row(telegram.NewButton("🔊 Озвучить текст", "nav:tts"), telegram.NewButton("🎚️ Громкость & EQ", "nav:volume")).
 		Row(telegram.NewButton("👥 Кто дома?", "nav:presence"), telegram.NewButton("📶 Сеть & Пинг", "nav:netdiag")).
 		Row(telegram.NewButton("💬 Диалоги с Алисой", "nav:dialogs")).
 		Row(telegram.NewButton("⚙️ Управление системой", "nav:system")).
@@ -531,7 +669,13 @@ func (a *App) showSoundboardMenu(ctx context.Context, chatID int64, msgID int64,
 		end = total
 	}
 
-	text := fmt.Sprintf("📢 *Саундборд* (Звуков: *%d*)\n\nВыберите звук для воспроизведения на колонке:", total)
+	nightNotice := ""
+	if a.night.ShouldBlockSoundboard() {
+		cfg := a.night.GetConfig()
+		nightNotice = fmt.Sprintf("\n⚠️ *Ночной режим активен (%02d:00 - %02d:00). Воспроизведение звуков заблокировано.*", cfg.StartHour, cfg.EndHour)
+	}
+
+	text := fmt.Sprintf("📢 *Саундборд* (Звуков: *%d*)%s\n\nВыберите звук для воспроизведения на колонке:", total, nightNotice)
 
 	builder := telegram.NewKeyboardBuilder()
 	if total > 0 {
@@ -795,7 +939,7 @@ func (a *App) showPresenceMenu(ctx context.Context, chatID int64, msgID int64) {
 		sb.WriteString(fmt.Sprintf("🌐 Подсеть сканирования: `%s`\n\n", a.scanner.GetSubnet()))
 	}
 
-	sb.WriteString("💡 *Чтобы присвоить имя устройству, напишите:*\n`/devname <MAC> <Имя>`\n_Пример: `/devname 24:0f:5e:02:02:9a Роутер Keenetic`_")
+	sb.WriteString("💡 *Чтобы присвоить имя устройству, напишите:*\n`/devname <MAC> <Имя>`\n_Пример:_ `/devname 24:0f:5e:02:02:9a Роутер Keenetic`_")
 
 	markup := telegram.NewKeyboardBuilder().
 		Row(telegram.NewButton("🔄 Сканировать снова", "nav:presence")).
@@ -882,6 +1026,149 @@ func (a *App) handleSetSubnetCommand(ctx context.Context, chatID int64, args str
 	}
 
 	a.sendEphemeral(ctx, chatID, fmt.Sprintf("✅ Подсеть сканирования успешно обновлена: *%s*", a.cfg.Subnet), userMsgID)
+}
+
+// -------------------------------------------------------------
+// Night Mode UI
+// -------------------------------------------------------------
+
+func (a *App) showNightModeMenu(ctx context.Context, chatID int64, msgID int64) {
+	cfg := a.night.GetConfig()
+	status := "выключен ⚪"
+	if cfg.Enabled {
+		if a.night.IsCurrentlyNight() {
+			status = "АКТИВЕН ПРЯМО СЕЙЧАС 🌙"
+		} else {
+			status = "включен (по расписанию) 🕒"
+		}
+	}
+
+	blockStatus := "да (блокируются) 🛑"
+	if !cfg.BlockSoundboard {
+		blockStatus = "нет (разрешены) 🟢"
+	}
+
+	nowStr := time.Now().Format("15:04")
+	text := fmt.Sprintf("🌙 *Ночной режим (Quiet Hours)*\n\n"+
+		"• Состояние: *%s*\n"+
+		"• Время на колонке: *%s*\n"+
+		"• Часы действия: *%02d:00 — %02d:00*\n"+
+		"• Ограничение громкости: *до %d%%*\n"+
+		"• Блокировка громких звуков: *%s*\n\n"+
+		"В ночные часы громкость колонки автоматически ограничивается, а громкие мемные звуки блокируются, чтобы не тревожить сон.",
+		status, nowStr, cfg.StartHour, cfg.EndHour, cfg.MaxVolume, blockStatus)
+
+	toggleBtn := telegram.NewButton("🌙 Включить ночной режим", "night:toggle")
+	if cfg.Enabled {
+		toggleBtn = telegram.NewButton("☀️ Выключить ночной режим", "night:toggle")
+	}
+
+	blockBtn := telegram.NewButton("📢 Блокировать звуки: ДА 🛑", "night:block:toggle")
+	if !cfg.BlockSoundboard {
+		blockBtn = telegram.NewButton("📢 Блокировать звуки: НЕТ 🟢", "night:block:toggle")
+	}
+
+	markup := telegram.NewKeyboardBuilder().
+		Row(toggleBtn).
+		Row(
+			telegram.NewButton("🕒 23:00 - 08:00", "night:hours:23:8"),
+			telegram.NewButton("🕒 00:00 - 07:00", "night:hours:0:7"),
+			telegram.NewButton("🕒 22:00 - 09:00", "night:hours:22:9"),
+		).
+		Row(
+			telegram.NewButton("🔊 Макс 20%", "night:vol:20"),
+			telegram.NewButton("🔊 Макс 25%", "night:vol:25"),
+			telegram.NewButton("🔊 Макс 30%", "night:vol:30"),
+		).
+		Row(blockBtn).
+		Row(telegram.NewButton("⬅️ К управлению звуком", "nav:volume")).
+		Build()
+
+	if msgID > 0 {
+		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
+	} else {
+		_, _ = a.tg.SendMarkdown(ctx, chatID, text, markup)
+	}
+}
+
+// -------------------------------------------------------------
+// Bluetooth UI (A2DP Sink)
+// -------------------------------------------------------------
+
+func (a *App) showBluetoothMenu(ctx context.Context, chatID int64, msgID int64) {
+	enabled := a.spk.IsBluetoothEnabled()
+	status := "выключен ⚪"
+	pidStr := ""
+	if enabled {
+		pid := a.spk.GetBluetoothPID()
+		status = "ВКЛЮЧЕН 🟢"
+		if pid != "" {
+			pidStr = fmt.Sprintf(" (PID: %s)", pid)
+		}
+	}
+
+	text := fmt.Sprintf("📶 *Bluetooth-аудиоприемник (A2DP Sink)*\n\n"+
+		"• Состояние стека: *%s*%s\n"+
+		"• Аппаратный контроллер: *Broadcom BCM43430*\n"+
+		"• Сервер: `/system/workdir/bin/bsa_server`\n\n"+
+		"💡 При включении Bluetooth Станция Mini становится доступна для сопряжения со смартфоном, планшетом или ноутбуком как беспроводная аудиоколонка.",
+		status, pidStr)
+
+	toggleBtn := telegram.NewButton("🟢 Включить Bluetooth", "bt:on")
+	if enabled {
+		toggleBtn = telegram.NewButton("🛑 Выключить Bluetooth", "bt:off")
+	}
+
+	markup := telegram.NewKeyboardBuilder().
+		Row(toggleBtn).
+		Row(telegram.NewButton("🔄 Перезапустить стек BSA", "bt:restart")).
+		Row(telegram.NewButton("⬅️ Назад в систему", "nav:system")).
+		Build()
+
+	if msgID > 0 {
+		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
+	} else {
+		_, _ = a.tg.SendMarkdown(ctx, chatID, text, markup)
+	}
+}
+
+// -------------------------------------------------------------
+// Equalizer UI
+// -------------------------------------------------------------
+
+func (a *App) showEqualizerMenu(ctx context.Context, chatID int64, msgID int64) {
+	curEQ := a.spk.GetEqualizerPreset()
+	curName := speaker.EqualizerPresetNames[curEQ]
+	if curName == "" {
+		curName = "Сбалансированный"
+	}
+
+	text := fmt.Sprintf("🎛️ *Пресеты эквалайзера (3-Band IIR EQ)*\n\n"+
+		"• Текущий профиль: *%s*\n\n"+
+		"Выберите профиль звучания под тип контента:\n"+
+		"• *⚖️ Сбалансированный:* ровная АЧХ (Flat, 0 dB)\n"+
+		"• *🔊 Усиление басов:* подъем НЧ (+7 dB @ 100 Hz)\n"+
+		"• *🗣️ Голос и подкасты:* выделение речи (+6 dB @ 1.1 kHz, срез НЧ)\n"+
+		"• *🎵 Яркий / Музыка:* подъем ВЧ (+6 dB @ 11 kHz) для инструментов",
+		curName)
+
+	markup := telegram.NewKeyboardBuilder().
+		Row(
+			telegram.NewButton("⚖️ Сбалансированный", "eq:balanced"),
+			telegram.NewButton("🔊 Усиление басов", "eq:bass_boost"),
+		).
+		Row(
+			telegram.NewButton("🗣️ Голос и подкасты", "eq:vocal"),
+			telegram.NewButton("🎵 Яркий / Музыка", "eq:treble"),
+		).
+		Row(telegram.NewButton("⬅️ К управлению звуком", "nav:volume")).
+		Build()
+
+	if msgID > 0 {
+		_, _ = a.tg.EditMessageTextQuick(ctx, chatID, msgID, text, telegram.ParseModeMarkdown, markup)
+	} else {
+		_, _ = a.tg.SendMarkdown(ctx, chatID, text, markup)
+	}
 }
 
 // -------------------------------------------------------------
@@ -999,7 +1286,28 @@ func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
 	if muted {
 		muteStatus = "ВКЛЮЧЕН (звук заглушен) 🔇"
 	}
-	text := fmt.Sprintf("🎚️ *Управление громкостью*\n\nТекущая громкость: *%d%%*\nРежим Mute: *%s*\n\nВыберите уровень или измените ступенями:", vol, muteStatus)
+
+	nightStatus := "выключен ⚪"
+	if a.night.GetConfig().Enabled {
+		if a.night.IsCurrentlyNight() {
+			nightStatus = "АКТИВЕН 🌙"
+		} else {
+			nightStatus = "включен (по расписанию) 🕒"
+		}
+	}
+
+	curEQ := a.spk.GetEqualizerPreset()
+	eqName := speaker.EqualizerPresetNames[curEQ]
+	if eqName == "" {
+		eqName = "Сбалансированный"
+	}
+
+	text := fmt.Sprintf("🎚️ *Управление звуком и громкостью*\n\n"+
+		"• Текущая громкость: *%d%%*\n"+
+		"• Режим Mute: *%s*\n"+
+		"• Ночной режим: *%s*\n"+
+		"• Эквалайзер: *%s*\n\n"+
+		"Выберите уровень или измените ступенями:", vol, muteStatus, nightStatus, eqName)
 
 	muteBtn := telegram.NewButton("🔇 Заглушить (Mute)", "mute:toggle")
 	if muted {
@@ -1010,6 +1318,7 @@ func (a *App) showVolumeMenu(ctx context.Context, chatID int64, msgID int64) {
 		Row(telegram.NewButton("🔉 -10%", "volstep:-10"), telegram.NewButton("🔊 +10%", "volstep:10")).
 		Row(telegram.NewButton("20%", "vol:20"), telegram.NewButton("40%", "vol:40"), telegram.NewButton("60%", "vol:60"), telegram.NewButton("80%", "vol:80"), telegram.NewButton("100%", "vol:100")).
 		Row(muteBtn).
+		Row(telegram.NewButton("🌙 Ночной режим", "nav:night"), telegram.NewButton("🎛️ Эквалайзер", "nav:eq")).
 		Row(telegram.NewButton("⬅️ Назад", "nav:main")).
 		Build()
 
@@ -1021,14 +1330,28 @@ func (a *App) showSystemMenu(ctx context.Context, chatID int64, msgID int64) {
 	if !a.spk.AreGesturesEnabled() {
 		gestureStatus = "заблокированы 🛑"
 	}
-	text := fmt.Sprintf("⚙️ *Управление системой*\n\n• Датчик жестов ToF: *%s*\n• Подсеть «Кто дома»: `%s`\n• Питание: онлайн\n\nВыберите действие:",
-		gestureStatus, a.scanner.GetSubnet())
+
+	btStatus := "выключен ⚪"
+	if a.spk.IsBluetoothEnabled() {
+		btStatus = "включен 🟢"
+	}
+
+	text := fmt.Sprintf("⚙️ *Управление системой*\n\n"+
+		"• Датчик жестов ToF: *%s*\n"+
+		"• Bluetooth (A2DP): *%s*\n"+
+		"• Подсеть «Кто дома»: `%s`\n"+
+		"• Питание: онлайн\n\n"+
+		"Выберите действие:",
+		gestureStatus, btStatus, a.scanner.GetSubnet())
+
 	gestureBtn := telegram.NewButton("✋ Заблокировать жесты", "gesture:off")
 	if !a.spk.AreGesturesEnabled() {
 		gestureBtn = telegram.NewButton("✋ Включить жесты", "gesture:on")
 	}
+
 	markup := telegram.NewKeyboardBuilder().
 		Row(gestureBtn).
+		Row(telegram.NewButton(fmt.Sprintf("📶 Bluetooth: %s", btStatus), "sys:bt_menu")).
 		Row(telegram.NewButton(fmt.Sprintf("🌐 Сменить подсеть (%s)", a.scanner.GetSubnet()), "sys:subnet")).
 		Row(telegram.NewButton("📋 Просмотр логов (Live Logs)", "sys:logs")).
 		Row(telegram.NewButton("🧹 Очистить кэш RAM", "sys:drop_caches")).

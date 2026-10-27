@@ -34,8 +34,13 @@ func TestConfigLoadSave(t *testing.T) {
 		t.Errorf("Subnet mismatch: got %s, want 192.168.1.0/24", loaded.Subnet)
 	}
 
-	// Test modifying and saving subnet
+	// Test modifying and saving subnet, night mode and eq
 	loaded.Subnet = "10.0.0.0/24"
+	loaded.NightModeEnabled = true
+	loaded.NightStartHour = 22
+	loaded.NightEndHour = 7
+	loaded.NightMaxVol = 20
+	loaded.EQPreset = "bass_boost"
 	if err := loaded.Save(cfgPath); err != nil {
 		t.Fatalf("Failed to re-save config: %v", err)
 	}
@@ -46,6 +51,12 @@ func TestConfigLoadSave(t *testing.T) {
 	}
 	if reloaded.Subnet != "10.0.0.0/24" {
 		t.Errorf("Updated subnet mismatch: got %s, want 10.0.0.0/24", reloaded.Subnet)
+	}
+	if reloaded.EQPreset != "bass_boost" {
+		t.Errorf("Updated EQPreset mismatch: got %s, want bass_boost", reloaded.EQPreset)
+	}
+	if reloaded.NightStartHour != 22 || reloaded.NightEndHour != 7 || reloaded.NightMaxVol != 20 {
+		t.Errorf("Updated night mode settings mismatch: %+v", reloaded)
 	}
 }
 
