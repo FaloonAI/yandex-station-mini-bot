@@ -26,6 +26,7 @@ rec_*.wav
 # OS / IDE
 .idea/
 .vscode/
+.opencode/
 *.swp
 .DS_Store
 Thumbs.db
