@@ -578,12 +578,13 @@ func (a *App) handleCallback(ctx context.Context, u *telegram.Update) {
 
 	case data == "gesture:off":
 		_ = a.spk.SetGesturesEnabled(false)
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Жесты заблокированы")
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Жесты заблокированы 🛑")
 		a.showSystemMenu(ctx, chatID, msgID)
 
 	case data == "gesture:on":
+		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Включение датчика жестов...")
 		_ = a.spk.SetGesturesEnabled(true)
-		_ = a.tg.AnswerCallbackAlert(ctx, cb.ID, "Жесты включены")
+		time.Sleep(1500 * time.Millisecond)
 		a.showSystemMenu(ctx, chatID, msgID)
 
 	case data == "sys:drop_caches":

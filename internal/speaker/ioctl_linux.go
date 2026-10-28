@@ -5,6 +5,7 @@ package speaker
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"syscall"
 )
 
@@ -29,5 +30,12 @@ func setHardwareGestures(enable bool) error {
 	if errno != 0 {
 		return fmt.Errorf("VL53L0X ioctl(0x%x) failed: %v", cmd, errno)
 	}
+
+	// When re-enabling, restart maind platformd so its readerThread re-opens
+	// /dev/stmvl53l0x_ranging and immediately resumes active continuous polling.
+	if enable {
+		_ = exec.Command("sh", "-c", "pkill -f 'maind --platformd'").Run()
+	}
+
 	return nil
 }
