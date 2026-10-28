@@ -1,31 +1,40 @@
 #!/bin/sh
 # start.sh: Service controller for Yandex Station Mini Bot
 BASE=/data/telegram-bot
+SUPERVISOR=$BASE/scripts/supervisor.sh
+SUPERVISOR_FALLBACK=$BASE/supervisor.sh
+SUPERVISOR_PIDFILE=$BASE/supervisor.pid
 PIDFILE=$BASE/bot.pid
-BIN=$BASE/yandex-mini-bot
-CONFIG=$BASE/config.json
 LOGFILE=$BASE/bot.log
+
+is_running() {
+  pidof yandex-mini-bot >/dev/null 2>&1
+}
 
 case "${1:-start}" in
   start)
-    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-      echo "Yandex Station Mini Bot is already running (PID $(cat $PIDFILE))"
+    if is_running; then
+      echo "Yandex Station Mini Bot is already running (PID $(pidof yandex-mini-bot))"
       exit 0
     fi
-    if [ ! -x "$BIN" ]; then
-      echo "Error: $BIN is not executable" >&2
-      exit 1
-    fi
-    echo "Starting Yandex Station Mini Bot..."
-    # Rotate log if large
+
+    # Rotate log if large (> 500KB)
     if [ -f "$LOGFILE" ] && [ $(wc -c < "$LOGFILE") -gt 500000 ]; then
       mv -f "$LOGFILE" "$LOGFILE.old"
     fi
-    LD_LIBRARY_PATH=/system/vendor/quasar/libs setsid "$BIN" -c "$CONFIG" </dev/null >>"$LOGFILE" 2>&1 &
-    echo $! > "$PIDFILE"
+
+    SUP="$SUPERVISOR"
+    if [ ! -x "$SUP" ]; then
+      SUP="$SUPERVISOR_FALLBACK"
+    fi
+
+    echo "Starting Yandex Station Mini Bot..."
+    setsid "$SUP" </dev/null >/dev/null 2>&1 &
+    echo $! > "$SUPERVISOR_PIDFILE"
+
     sleep 1
-    if kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-      echo "Bot started successfully (PID $(cat $PIDFILE))"
+    if is_running; then
+      echo "Bot started successfully (PID $(pidof yandex-mini-bot))"
     else
       echo "Bot failed to start. Last log lines:" >&2
       tail -n 15 "$LOGFILE" >&2
@@ -34,19 +43,14 @@ case "${1:-start}" in
     ;;
 
   stop)
-    if [ -f "$PIDFILE" ]; then
-      PID=$(cat "$PIDFILE")
-      echo "Stopping Yandex Station Mini Bot (PID $PID)..."
-      kill "$PID" 2>/dev/null
-      tries=0
-      while kill -0 "$PID" 2>/dev/null && [ "$tries" -lt 10 ]; do
-        sleep 1
-        tries=$((tries + 1))
-      done
-      kill -9 "$PID" 2>/dev/null
-      rm -f "$PIDFILE"
+    echo "Stopping Yandex Station Mini Bot..."
+    if [ -f "$SUPERVISOR_PIDFILE" ]; then
+      kill -9 $(cat "$SUPERVISOR_PIDFILE") 2>/dev/null || true
+      rm -f "$SUPERVISOR_PIDFILE"
     fi
+    killall -9 supervisor.sh 2>/dev/null || true
     killall -9 yandex-mini-bot 2>/dev/null || true
+    rm -f "$PIDFILE"
     echo "Bot stopped."
     ;;
 
@@ -57,8 +61,9 @@ case "${1:-start}" in
     ;;
 
   status)
-    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-      echo "Yandex Station Mini Bot is RUNNING (PID $(cat $PIDFILE))"
+    if is_running; then
+      echo "Yandex Station Mini Bot is RUNNING (PID $(pidof yandex-mini-bot))"
+      exit 0
     else
       echo "Yandex Station Mini Bot is STOPPED"
       exit 1

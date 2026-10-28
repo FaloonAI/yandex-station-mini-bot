@@ -56,3 +56,24 @@ func TestAnsiFilter(t *testing.T) {
 		t.Errorf("expected 'Error: Success', got %q", cleaned)
 	}
 }
+
+func TestGesturesToggle(t *testing.T) {
+	c := NewController("/tmp/sounds", "/tmp/scripts", "/tmp/logs")
+	if !c.AreGesturesEnabled() {
+		t.Error("expected gestures to be enabled by default")
+	}
+
+	if err := c.SetGesturesEnabled(false); err != nil {
+		t.Fatalf("unexpected error disabling gestures: %v", err)
+	}
+	if c.AreGesturesEnabled() {
+		t.Error("expected gestures to be disabled")
+	}
+
+	if err := c.SetGesturesEnabled(true); err != nil {
+		t.Fatalf("unexpected error enabling gestures: %v", err)
+	}
+	if !c.AreGesturesEnabled() {
+		t.Error("expected gestures to be re-enabled")
+	}
+}

@@ -390,13 +390,14 @@ func (c *Controller) GetWiFiStatus() (string, error) {
 func (c *Controller) SetGesturesEnabled(enable bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.gesturesOn = enable
 
-	sig := "-STOP"
-	if enable {
-		sig = "-CONT"
+	if err := setHardwareGestures(enable); err != nil {
+		slog.Warn("[Gestures] hardware control warning", "error", err)
 	}
-	return exec.Command("killall", sig, "input_eventd").Run()
+
+	c.gesturesOn = enable
+	slog.Info("[Gestures] Updated state", "enabled", enable)
+	return nil
 }
 
 func (c *Controller) AreGesturesEnabled() bool {
